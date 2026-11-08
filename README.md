@@ -45,11 +45,16 @@ description = "smart focus toggle"
 ## Config
 
 - `focus_ratio` in `$HERDR_PLUGIN_CONFIG_DIR/config.toml` (see
-  `herdr plugin config-dir andpeicunha.smart-focus`), default `0.70`.
+  `herdr plugin config-dir andpeicunha.smart-focus`), default `0.70`. If
+  `HERDR_PLUGIN_CONFIG_DIR` is unset, the daemon falls back to
+  `~/.config/herdr/plugins/config/andpeicunha.smart-focus` (state:
+  `~/.local/state/herdr/plugins/andpeicunha.smart-focus`).
 - `balance_others` (bool, default `true`): splits off the focus path are set
   to `leaves(first)/leaves(total)`, so all unfocused panes of a subtree get
-  equal size (`A | (B/C/D)`: focus A -> B,C,D 1/3 each; focus C -> C 70% of the
-  column, B and D equal). `false` leaves off-path splits untouched (0.1
+  equal size. Consecutive same-direction splits on the path count as one
+  row/column: the focused pane gets `focus_ratio` of the whole column and the
+  rest is split equally among the others (`A | (B/C/D)`: focus A -> B,C,D 1/3
+  each; focus C with 0.85 -> B 7.5%, C 85%, D 7.5% of the column). `false` leaves off-path splits untouched (0.1
   behavior). Env override: `HERDR_SMART_FOCUS_BALANCE=0|1`.
 - `HERDR_SMART_FOCUS_RATIO` env var overrides it (read by the daemon at
   start of the daemon's environment).

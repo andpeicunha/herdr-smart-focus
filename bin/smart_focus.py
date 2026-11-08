@@ -29,9 +29,24 @@ SUBSCRIPTIONS = ["pane.focused", "pane.created", "pane.closed", "layout.updated"
 def state_dir():
     d = (os.environ.get("HERDR_SMART_FOCUS_STATE_DIR")
          or os.environ.get("HERDR_PLUGIN_STATE_DIR")
-         or os.path.expanduser("~/.local/state/herdr-smart-focus"))
+         or os.path.expanduser("~/.local/state/herdr/plugins/andpeicunha.smart-focus"))
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def config_dir():
+    d = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+    if d:
+        return d
+    d = os.path.expanduser("~/.config/herdr/plugins/config/andpeicunha.smart-focus")
+    if os.path.isdir(d):
+        return d
+    try:
+        out = subprocess.run(["herdr", "plugin", "config-dir", "andpeicunha.smart-focus"],
+                             capture_output=True, text=True, timeout=3).stdout.strip()
+        return out or None
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def socket_path():
@@ -43,7 +58,7 @@ def load_ratio():
     env = os.environ.get("HERDR_SMART_FOCUS_RATIO")
     if env:
         return core.clamp_ratio(env)
-    cfg_dir = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+    cfg_dir = config_dir()
     if cfg_dir:
         try:
             with open(os.path.join(cfg_dir, "config.toml"), "r", encoding="utf-8") as fh:
@@ -65,7 +80,7 @@ def load_balance():
     env = os.environ.get("HERDR_SMART_FOCUS_BALANCE")
     if env:
         return env.strip().lower() not in ("0", "false", "no", "off")
-    cfg_dir = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+    cfg_dir = config_dir()
     if cfg_dir:
         try:
             with open(os.path.join(cfg_dir, "config.toml"), "r", encoding="utf-8") as fh:

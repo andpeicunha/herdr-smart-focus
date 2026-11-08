@@ -65,7 +65,7 @@ class BalanceTest(unittest.TestCase):
 
     def test_focus_c_equal_others(self):
         ops = core.compute_ops(ABCD, "C", 0.7)
-        self.assertEqual(ops, [([], 0.3), ([True], 0.3), ([True, True], 0.7)])
+        self.assertEqual(ops, [([], 0.3), ([True], 0.15), ([True, True], 0.8235)])
 
     def test_focus_b(self):
         ops = core.compute_ops(ABCD, "B", 0.7)
@@ -87,6 +87,43 @@ class BalanceTest(unittest.TestCase):
     def test_disabled_keeps_old_behavior(self):
         self.assertEqual(core.compute_ops(ABCD, "A", 0.7, balance_others=False),
                          [([], 0.7)])
+
+
+def ratios(ops):
+    return {tuple(p): r for p, r in ops}
+
+
+class GroupTest(unittest.TestCase):
+    T = split("right", 0.5, pane("A"), split("down", 0.5, pane("B"), split("down", 0.5, pane("C"), pane("D"))))
+
+    def test_focus_c_in_column(self):
+        # B=7.5%, C=85%, D=7.5% of the column
+        r = ratios(core.compute_ops(self.T, "C", 0.85))
+        self.assertEqual(r[()], 0.15)
+        self.assertAlmostEqual(r[(True,)], 0.075, places=4)
+        self.assertAlmostEqual(r[(True, True)], 0.85 / 0.925, places=4)
+
+    def test_focus_d_in_column(self):
+        r = ratios(core.compute_ops(self.T, "D", 0.85))
+        self.assertAlmostEqual(r[(True,)], 0.075, places=4)
+        self.assertAlmostEqual(r[(True, True)], 0.075 / 0.925, places=4)
+
+    def test_focus_b_in_column(self):
+        r = ratios(core.compute_ops(self.T, "B", 0.85))
+        self.assertAlmostEqual(r[(True,)], 0.85, places=4)
+        self.assertNotIn((True, True), r)  # C/D already 0.5
+
+    def test_four_stacked(self):
+        t = split("down", 0.5, pane("A"), split("down", 0.5, pane("B"),
+                  split("down", 0.5, pane("C"), pane("D"))))
+        r = ratios(core.compute_ops(t, "C", 0.7))
+        self.assertEqual(r[()], 0.1)
+        self.assertAlmostEqual(r[(True,)], 0.1 / 0.9, places=4)
+        self.assertAlmostEqual(r[(True, True)], 0.875, places=4)
+
+    def test_perpendicular_not_grouped(self):
+        t = split("right", 0.5, pane("A"), split("down", 0.5, pane("B"), pane("C")))
+        self.assertEqual(ratios(core.compute_ops(t, "C", 0.7)), {(): 0.3, (True,): 0.3})
 
 
 class ShapeTest(unittest.TestCase):
