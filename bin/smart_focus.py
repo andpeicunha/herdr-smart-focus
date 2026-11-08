@@ -2,8 +2,9 @@
 """smart-focus: grow the focused pane along its root->pane split path.
 
 Subcommands: daemon | ensure | toggle | enable | disable | status
-Uses only layout.export + layout.set_split_ratio (no layout.apply / pane.swap /
-pane.move), so panes and processes are never recreated.
+layout = "keep" (default) uses only layout.export + layout.set_split_ratio.
+layout = "stack-bottom" | "stack-right" additionally uses pane.swap and
+pane.move (never layout.apply), so panes and processes are never recreated.
 """
 import fcntl
 import json
@@ -52,6 +53,40 @@ def config_dir():
 def socket_path():
     return (os.environ.get("HERDR_SOCKET_PATH")
             or os.path.expanduser("~/.config/herdr/herdr.sock"))
+
+
+def read_config():
+    cfg_dir = config_dir()
+    if not cfg_dir:
+        return {}
+    try:
+        with open(os.path.join(cfg_dir, "config.toml"), "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return {}
+    try:
+        import tomllib
+        return tomllib.loads(text)
+    except ImportError:
+        out = {}
+        for line in text.splitlines():
+            k, _, v = line.partition("=")
+            v = v.split("#")[0].strip().strip('"').strip("'")
+            if k.strip() and v:
+                out[k.strip()] = v
+        return out
+    except ValueError:
+        return {}
+
+
+def load_layout():
+    env = os.environ.get("HERDR_SMART_FOCUS_LAYOUT")
+    return core.normalize_layout(env if env else read_config().get("layout"))
+
+
+def load_stack_ratio():
+    env = os.environ.get("HERDR_SMART_FOCUS_STACK_RATIO")
+    return core.clamp_stack_ratio(env if env else read_config().get("stack_ratio", core.DEFAULT_STACK_RATIO))
 
 
 def load_ratio():
@@ -151,6 +186,91 @@ def notify(title, body=""):
         pass
 
 
+# ---------- applying a layout ----------
+
+TMP_TAB_LABEL = "smart-focus-tmp"
+
+
+def tab_is_focused(tab_id):
+    try:
+        for t in request("tab.list")["tabs"]:
+            if t.get("tab_id") == tab_id:
+                return bool(t.get("focused"))
+    except (HerdrError, KeyError, OSError):
+        pass
+    return False
+
+
+def _recover(tab_id, tmp, log):
+    """Best effort: bring panes stranded in the scratch tab back."""
+    try:
+        stranded = core.leaves(export_layout(tab_id=tmp)["root"])
+        anchor = core.leaves(export_layout(tab_id=tab_id)["root"])[0]
+    except (HerdrError, KeyError, IndexError, OSError):
+        return
+    for p in stranded:
+        try:
+            request("pane.move", {"pane_id": p, "focus": False, "destination": {
+                "type": "tab", "tab_id": tab_id, "split": "right", "target_pane_id": anchor}})
+        except HerdrError as exc:
+            log("recover failed %s: %s" % (p, exc))
+
+
+def run_stack_ops(tab_id, ops, log):
+    """Execute core.plan_stack ops. Returns the pane to expect a pane.focused for."""
+    tmp = last_out = None
+    expect = None
+    try:
+        for op in ops:
+            kind = op[0]
+            if kind == "swap":
+                if not tab_is_focused(tab_id):
+                    continue  # pane.swap focuses the tab; don't steal the view
+                request("pane.swap", {"source_pane_id": op[1], "target_pane_id": op[2]})
+                expect = op[1]
+            elif kind == "move_out":
+                dest = ({"type": "new_tab", "label": TMP_TAB_LABEL} if tmp is None else
+                        {"type": "tab", "tab_id": tmp, "split": "right", "target_pane_id": last_out})
+                res = request("pane.move", {"pane_id": op[1], "destination": dest, "focus": False})
+                tmp = tmp or res["move_result"]["pane"]["tab_id"]
+                last_out = op[1]
+            elif kind == "move_in":
+                request("pane.move", {"pane_id": op[1], "focus": False, "destination": {
+                    "type": "tab", "tab_id": tab_id, "split": op[2], "target_pane_id": op[3]}})
+            elif kind == "focus":
+                request("pane.focus", {"pane_id": op[1]})
+                expect = op[1]
+            elif kind == "ratio":
+                request("layout.set_split_ratio", {"tab_id": tab_id, "path": op[1], "ratio": op[2]})
+    except (HerdrError, KeyError) as exc:
+        log("stack op failed %s: %s" % (tab_id, exc))
+        if tmp:
+            _recover(tab_id, tmp, log)
+    return expect
+
+
+def apply_layout(layout, pane_id, log):
+    """Apply the configured mode to an exported layout.
+    Returns (did_something, pane_expected_to_emit_focus)."""
+    mode = load_layout()
+    tab_id = layout["tab_id"]
+    if mode == "keep":
+        ops = core.compute_ops(layout["root"], pane_id, load_ratio(), balance_others=load_balance(),
+                                clamp_targets=True)
+        for path, ratio in ops:
+            try:
+                request("layout.set_split_ratio", {"tab_id": tab_id, "path": path, "ratio": ratio})
+            except HerdrError as exc:
+                log("set_split_ratio failed %s %s: %s" % (tab_id, path, exc))
+                break
+        return bool(ops), None
+    ops = core.plan_stack(layout["root"], pane_id, mode, load_stack_ratio())
+    if not ops:
+        return False, None
+    log("stack %s tab=%s focus=%s ops=%s" % (mode, tab_id, pane_id, [o[0] for o in ops]))
+    return True, run_stack_ops(tab_id, ops, log)
+
+
 # ---------- daemon ----------
 
 class Daemon:
@@ -158,6 +278,8 @@ class Daemon:
         self.q = queue.Queue()
         self.shapes = {}       # tab_id -> last seen shape signature
         self.suppress = {}     # tab_id -> monotonic deadline (our own layout.updated)
+        self.expect_focus = {}  # pane_id -> deadline (pane.focused caused by our swap/focus)
+        self.op_window = (0.0, 0.0)  # monotonic [start, end] of our last structural ops
 
     def log(self, msg):
         print("%s %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
@@ -170,22 +292,31 @@ class Daemon:
         if tab_id not in load_enabled() or layout.get("zoomed"):
             return
         pane_id = force_pane or layout.get("focused_pane_id")
-        ops = core.compute_ops(root, pane_id, load_ratio(), balance_others=load_balance())
-        if not ops:
-            return
         self.suppress[tab_id] = time.monotonic() + SELF_SUPPRESS_S
-        for path, ratio in ops:
-            try:
-                request("layout.set_split_ratio", {"tab_id": tab_id, "path": path, "ratio": ratio})
-            except HerdrError as exc:
-                self.log("set_split_ratio failed %s %s: %s" % (tab_id, path, exc))
-                break
+        started = time.monotonic()
+        did, expect = apply_layout(layout, pane_id, self.log)
+        if did:
+            # pane.focused emitted while we move/swap panes are ours, not the user's
+            self.op_window = (started, time.monotonic() + DEBOUNCE_S * 2)
+        if not did:
+            self.suppress.pop(tab_id, None)
+            return
+        try:  # remember the post-op shape so our own changes are not "structural"
+            self.shapes[tab_id] = core.shape_signature(export_layout(tab_id=tab_id)["root"])
+        except (HerdrError, KeyError, OSError):
+            self.shapes.pop(tab_id, None)
+        if expect:
+            self.expect_focus[expect] = time.monotonic() + SELF_SUPPRESS_S
         self.suppress[tab_id] = time.monotonic() + SELF_SUPPRESS_S
 
     def handle_batch(self, events):
         focus_panes, layout_tabs, any_tab_focus = [], [], False
-        for name, data in events:
+        for name, data, ts in events:
             if name == "pane_focused" and data.get("pane_id"):
+                if self.op_window[0] <= ts <= self.op_window[1]:
+                    continue  # echo of our own move/swap/focus
+                if time.monotonic() < self.expect_focus.get(data["pane_id"], 0):
+                    continue
                 focus_panes.append(data["pane_id"])
             elif name == "tab_focused":
                 any_tab_focus = True
@@ -250,7 +381,7 @@ class Daemon:
                 raise HerdrError(str(msg["error"]))
             ev = msg.get("event")
             if ev:
-                self.q.put((ev.replace(".", "_"), msg.get("data") or {}))
+                self.q.put((ev.replace(".", "_"), msg.get("data") or {}, time.monotonic()))
         raise HerdrError("stream closed")
 
     def reader_loop(self):
@@ -263,7 +394,7 @@ class Daemon:
                 failing_since = failing_since or now
                 if now - failing_since > RECONNECT_GIVEUP_S:
                     self.log("giving up reconnect: %s" % exc)
-                    self.q.put(("__exit__", {}))
+                    self.q.put(("__exit__", {}, 0.0))
                     return
                 self.log("reader: %s; retrying" % exc)
                 time.sleep(2)
@@ -280,7 +411,7 @@ class Daemon:
                     batch.append(self.q.get(timeout=DEBOUNCE_S))
                 except queue.Empty:
                     break
-            if any(n == "__exit__" for n, _ in batch):
+            if any(b[0] == "__exit__" for b in batch):
                 return
             try:
                 self.handle_batch(batch)
@@ -368,10 +499,8 @@ def cmd_toggle_like(action):
     if want:  # apply right away for the current focus
         try:
             layout = export_layout(tab_id=tab)
-            ops = core.compute_ops(layout["root"], layout.get("focused_pane_id"), load_ratio(),
-                                   balance_others=load_balance())
-            for path, ratio in ops:
-                request("layout.set_split_ratio", {"tab_id": tab, "path": path, "ratio": ratio})
+            apply_layout(layout, layout.get("focused_pane_id"),
+                         lambda m: print(m, file=sys.stderr))
         except HerdrError as exc:
             print("apply failed: %s" % exc, file=sys.stderr)
     return 0
@@ -381,6 +510,7 @@ def cmd_status():
     tab = resolve_tab()
     info = {"daemon_pid": daemon_pid(), "tab_id": tab,
             "tab_enabled": tab in load_enabled(), "focus_ratio": load_ratio(),
+            "layout": load_layout(), "stack_ratio": load_stack_ratio(),
             "balance_others": load_balance(),
             "enabled_tabs": sorted(load_enabled()), "state_dir": state_dir()}
     out = json.dumps(info, indent=2)

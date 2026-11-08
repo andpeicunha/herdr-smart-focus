@@ -1,10 +1,11 @@
 # herdr-smart-focus
 
-Herdr plugin (**beta**, `0.2.0-beta`). When focus moves to a pane, that pane
-grows to ~70% (`focus_ratio`) along every split on the path root -> pane. It
-only calls `layout.export` and `layout.set_split_ratio`, so panes and their
-processes are never recreated, swapped or moved (no `layout.apply`,
-`pane.swap`, `pane.move`).
+Herdr plugin (**beta**, `0.3.0-beta`). When focus moves to a pane, that pane
+grows to ~70% (`focus_ratio`) along every split on the path root -> pane.
+With the default `layout = "keep"` it only calls `layout.export` and
+`layout.set_split_ratio`, so panes are never swapped or moved. The optional
+stack layouts (below) also use `pane.swap` / `pane.move`; processes and
+scrollback are preserved (never `layout.apply`, which recreates panes).
 
 ## How it works
 
@@ -59,6 +60,37 @@ description = "smart focus toggle"
 - `HERDR_SMART_FOCUS_RATIO` env var overrides it (read by the daemon at
   start of the daemon's environment).
 - Values are clamped to 0.5..0.9.
+- All ratio targets are clamped to herdr's 0.1..0.9 before comparing with the
+  current ratio, so unreachable targets are not re-sent on every focus change.
+- `layout = "keep" | "stack-bottom" | "stack-right"` (default `"keep"` =
+  behavior above, unchanged). Env override: `HERDR_SMART_FOCUS_LAYOUT`.
+- `stack_ratio` (default `0.72`, clamped 0.1..0.9): share of the focused pane
+  in the stack layouts. Env override: `HERDR_SMART_FOCUS_STACK_RATIO`.
+  (`focus_ratio`/`balance_others` only apply to `keep`.)
+- Env overrides are read from the daemon's environment at start.
+
+## Stack layouts
+
+- `stack-bottom`: the unfocused panes sit side by side in equal parts on top;
+  the focused pane is at the bottom with `stack_ratio` of the height.
+- `stack-right`: the unfocused panes are stacked in equal parts on the left;
+  the focused pane is on the right with `stack_ratio` of the width.
+- Focus change: the pane that was in the big slot takes the strip slot the new
+  focused pane came from (`pane.swap`; focus ends on the pane you chose).
+- First activation on an arbitrary tab (or after a pane is added/removed or the
+  tree no longer matches): the layout is rebuilt in reading order with the
+  focused pane in the big slot. This uses `pane.move` through a short-lived
+  scratch tab `smart-focus-tmp`; the anchor pane never leaves the tab. Pids and
+  scrollback are preserved (verified on herdr 0.9.5). If a move fails, stranded
+  panes are moved back.
+- Disabling smart focus (or switching back to `keep`) leaves the layout as is.
+- `pane.swap` focuses the tab, so a swap is skipped when the tab is not the
+  focused one (ratios are still fixed). `pane.focused` events emitted during
+  our own operations are ignored (a focus change you make within ~0.2 s of a
+  rebuild may be dropped).
+- Planning is a pure function:
+  `smart_focus_core.plan_stack(tree, focused, mode, stack_ratio)` ->
+  `[("swap"|"move_out"|"move_in"|"focus"|"ratio", ...)]`.
 
 State (`tabs.json`, `daemon.lock`, `daemon.log`) lives in
 `$HERDR_PLUGIN_STATE_DIR` (fallback `~/.local/state/herdr-smart-focus`).

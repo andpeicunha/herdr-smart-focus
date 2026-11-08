@@ -12,6 +12,31 @@ share of the FIRST child.
 MIN_RATIO = 0.5
 MAX_RATIO = 0.9
 DEFAULT_RATIO = 0.70
+# herdr clamps every split ratio to this range; targets outside it would be
+# re-sent forever (current ratio never reaches the target).
+SPLIT_MIN = 0.1
+SPLIT_MAX = 0.9
+DEFAULT_STACK_RATIO = 0.72
+LAYOUTS = ("keep", "stack-bottom", "stack-right")
+
+
+def clamp_split(value):
+    return max(SPLIT_MIN, min(SPLIT_MAX, float(value)))
+
+
+def clamp_stack_ratio(value, default=DEFAULT_STACK_RATIO):
+    try:
+        r = float(value)
+    except (TypeError, ValueError):
+        return default
+    if r != r:
+        return default
+    return clamp_split(r)
+
+
+def normalize_layout(value):
+    v = str(value or "keep").strip().lower()
+    return v if v in LAYOUTS else "keep"
 
 
 def clamp_ratio(value, default=DEFAULT_RATIO):
@@ -36,15 +61,17 @@ def count_leaves(node):
     return count_leaves(node["first"]) + count_leaves(node["second"])
 
 
-def _balance_ops(node, path, ops, eps):
+def _balance_ops(node, path, ops, eps, clamp=False):
     """Splits in an off-path subtree: ratio = leaves(first)/leaves(total)."""
     if node.get("type") != "split":
         return
     target = count_leaves(node["first"]) / float(count_leaves(node))
+    if clamp:
+        target = clamp_split(target)
     if abs(float(node["ratio"]) - target) > eps:
         ops.append((list(path), round(target, 4)))
-    _balance_ops(node["first"], path + [False], ops, eps)
-    _balance_ops(node["second"], path + [True], ops, eps)
+    _balance_ops(node["first"], path + [False], ops, eps, clamp)
+    _balance_ops(node["second"], path + [True], ops, eps, clamp)
 
 
 def axis_count(node, direction):
@@ -66,7 +93,8 @@ def _path_nodes(root, pane_id):
     return out
 
 
-def compute_ops(root, pane_id, focus_ratio=DEFAULT_RATIO, eps=0.005, balance_others=True):
+def compute_ops(root, pane_id, focus_ratio=DEFAULT_RATIO, eps=0.005, balance_others=True,
+                clamp_targets=False):
     """Return [(path, ratio)] to apply, root first.
 
     Splits on root->pane: with `balance_others`, consecutive same-direction
@@ -75,7 +103,9 @@ def compute_ops(root, pane_id, focus_ratio=DEFAULT_RATIO, eps=0.005, balance_oth
     to their extent along that axis. Without it, each split's focused side
     gets `focus_ratio`. With `balance_others`, splits off the path are set so
     all leaves of a subtree get equal size. Splits already within `eps` are
-    skipped. Returns [] when the pane is not in the tree or is alone.
+    skipped. `clamp_targets` clamps every target to herdr's [0.1, 0.9] so an
+    unreachable target is not re-sent forever (the daemon always sets it).
+    Returns [] when the pane is not in the tree or is alone.
     """
     focus_ratio = clamp_ratio(focus_ratio)
     if not contains_pane(root, pane_id):
@@ -114,6 +144,9 @@ def compute_ops(root, pane_id, focus_ratio=DEFAULT_RATIO, eps=0.005, balance_oth
     else:
         for idx, (sp, in_first) in enumerate(nodes):
             targets[idx] = focus_ratio if in_first else 1.0 - focus_ratio
+    if clamp_targets:
+        for idx in targets:
+            targets[idx] = clamp_split(targets[idx])
     ops = []
     path = []
     for idx, (sp, in_first) in enumerate(nodes):
@@ -121,7 +154,7 @@ def compute_ops(root, pane_id, focus_ratio=DEFAULT_RATIO, eps=0.005, balance_oth
             ops.append((list(path), round(targets[idx], 4)))
         if balance_others:
             off = sp["second"] if in_first else sp["first"]
-            _balance_ops(off, path + [in_first], ops, eps)
+            _balance_ops(off, path + [in_first], ops, eps, clamp_targets)
         path.append(not in_first)
     return ops
 
@@ -135,3 +168,113 @@ def shape_signature(root):
         shape_signature(root["first"]),
         shape_signature(root["second"]),
     )
+
+
+# ---------- stack layouts (stack-bottom / stack-right) ----------
+#
+# Target shape, stack-bottom:  split(down, first=STRIP, second=focused pane)
+# stack-right:                 split(right, first=STRIP, second=focused pane)
+# STRIP = the other panes, all splits in one direction (right for bottom,
+# down for right), equal parts. `ratio` of the root = share of the strip
+# = 1 - stack_ratio.
+#
+# plan_stack returns ops, executed in order by the daemon:
+#   ("swap", source_pane, target_pane)   source ends up focused (herdr semantics)
+#   ("move_out", pane)                   move to a scratch tab (pane.move)
+#   ("move_in", pane, split, target)     move back next to `target`
+#   ("focus", pane)
+#   ("ratio", path, ratio)               layout.set_split_ratio
+# Paths of "ratio" ops refer to the tree AFTER the structural ops.
+
+STACK_DIRS = {"stack-bottom": ("down", "right"), "stack-right": ("right", "down")}
+
+
+def leaves(node):
+    """pane ids in reading order (first before second)."""
+    if node.get("type") == "pane":
+        return [node.get("pane_id")]
+    return leaves(node["first"]) + leaves(node["second"])
+
+
+def _only_direction(node, direction):
+    if node.get("type") == "pane":
+        return True
+    return (node.get("direction") == direction
+            and _only_direction(node["first"], direction)
+            and _only_direction(node["second"], direction))
+
+
+def is_stack_shape(root, mode):
+    root_dir, strip_dir = STACK_DIRS[mode]
+    return (root.get("type") == "split" and root.get("direction") == root_dir
+            and root["second"].get("type") == "pane"
+            and _only_direction(root["first"], strip_dir))
+
+
+def _chain(panes, direction):
+    node = {"type": "pane", "pane_id": panes[-1]}
+    for p in reversed(panes[:-1]):
+        node = {"type": "split", "direction": direction, "ratio": 0.5,
+                "first": {"type": "pane", "pane_id": p}, "second": node}
+    return node
+
+
+def build_stack_tree(strip_panes, focused, mode):
+    """Simulated tree for a restructure (strip panes in order, right-chain)."""
+    root_dir, strip_dir = STACK_DIRS[mode]
+    return {"type": "split", "direction": root_dir, "ratio": 0.5,
+            "first": _chain(strip_panes, strip_dir),
+            "second": {"type": "pane", "pane_id": focused}}
+
+
+def stack_ratio_ops(root, stack_ratio, mode, eps=0.005, force=False):
+    """[(path, ratio)] so the strip is equal parts and focused = stack_ratio.
+    `force` emits every split (used right after a restructure, where the
+    real ratios are unknown)."""
+    stack_ratio = clamp_stack_ratio(stack_ratio)
+    ops = []
+
+    def want(node, path, target):
+        target = round(clamp_split(target), 4)
+        if force or abs(float(node["ratio"]) - target) > eps:
+            ops.append((list(path), target))
+
+    want(root, [], 1.0 - stack_ratio)
+
+    def strip(node, path):
+        if node.get("type") != "split":
+            return
+        want(node, path, count_leaves(node["first"]) / float(count_leaves(node)))
+        strip(node["first"], path + [False])
+        strip(node["second"], path + [True])
+
+    strip(root["first"], [False])
+    return ops
+
+
+def plan_stack(root, focused, mode, stack_ratio=DEFAULT_STACK_RATIO, eps=0.005):
+    """Pure planner: (tree, focused pane, mode) -> ordered op list (see above)."""
+    if mode not in STACK_DIRS or not contains_pane(root, focused):
+        return []
+    order = leaves(root)
+    if len(order) < 2:
+        return []
+    root_dir, strip_dir = STACK_DIRS[mode]
+    if is_stack_shape(root, mode):
+        ops = []
+        bottom = root["second"]["pane_id"]
+        if bottom != focused:
+            ops.append(("swap", focused, bottom))
+            # same shape afterwards; strip/ratio ops depend on shape only
+        ops += [("ratio", p, r) for p, r in stack_ratio_ops(root, stack_ratio, mode, eps)]
+        return ops
+    strip = [p for p in order if p != focused]
+    anchor = strip[0]
+    ops = [("move_out", focused)] + [("move_out", p) for p in strip[1:]]
+    ops.append(("move_in", focused, root_dir, anchor))
+    for i in range(1, len(strip)):
+        ops.append(("move_in", strip[i], strip_dir, strip[i - 1]))
+    ops.append(("focus", focused))
+    target = build_stack_tree(strip, focused, mode)
+    ops += [("ratio", p, r) for p, r in stack_ratio_ops(target, stack_ratio, mode, force=True)]
+    return ops
