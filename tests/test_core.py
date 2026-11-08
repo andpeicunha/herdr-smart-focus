@@ -44,7 +44,7 @@ class ComputeOpsTest(unittest.TestCase):
 
     def test_siblings_off_path_untouched(self):
         t = split("right", 0.5, split("down", 0.9, pane("A"), pane("B")), pane("C"))
-        paths = [p for p, _ in core.compute_ops(t, "C", 0.7)]
+        paths = [p for p, _ in core.compute_ops(t, "C", 0.7, balance_others=False)]
         self.assertEqual(paths, [[]])
 
     def test_clamp(self):
@@ -52,6 +52,41 @@ class ComputeOpsTest(unittest.TestCase):
         self.assertEqual(core.clamp_ratio(0.1), 0.5)
         self.assertEqual(core.clamp_ratio("abc"), core.DEFAULT_RATIO)
         self.assertEqual(core.compute_ops(TREE, "A", 5), [([], 0.9)])
+
+
+COL = split("down", 0.5, pane("B"), split("down", 0.5, pane("C"), pane("D")))
+ABCD = split("right", 0.5, pane("A"), COL)
+
+
+class BalanceTest(unittest.TestCase):
+    def test_focus_a_balances_column(self):
+        self.assertEqual(core.compute_ops(ABCD, "A", 0.7),
+                         [([], 0.7), ([True], 0.3333)])
+
+    def test_focus_c_equal_others(self):
+        ops = core.compute_ops(ABCD, "C", 0.7)
+        self.assertEqual(ops, [([], 0.3), ([True], 0.3), ([True, True], 0.7)])
+
+    def test_focus_b(self):
+        ops = core.compute_ops(ABCD, "B", 0.7)
+        self.assertEqual(ops, [([], 0.3), ([True], 0.7)])  # C/D split already 0.5
+
+    def test_off_path_inside_nonfocused_side(self):
+        t = split("right", 0.5, pane("A"), COL)
+        t["second"]["ratio"] = 0.7
+        t["second"]["second"]["ratio"] = 0.9
+        paths = {tuple(p): r for p, r in core.compute_ops(t, "A", 0.7)}
+        self.assertEqual(paths[(True,)], 0.3333)
+        self.assertEqual(paths[(True, True)], 0.5)
+
+    def test_skip_when_equal(self):
+        t = split("right", 0.7, pane("A"), split("down", 1 / 3.0, pane("B"),
+                  split("down", 0.5, pane("C"), pane("D"))))
+        self.assertEqual(core.compute_ops(t, "A", 0.7), [])
+
+    def test_disabled_keeps_old_behavior(self):
+        self.assertEqual(core.compute_ops(ABCD, "A", 0.7, balance_others=False),
+                         [([], 0.7)])
 
 
 class ShapeTest(unittest.TestCase):

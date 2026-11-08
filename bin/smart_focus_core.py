@@ -30,11 +30,30 @@ def contains_pane(node, pane_id):
     return contains_pane(node["first"], pane_id) or contains_pane(node["second"], pane_id)
 
 
-def compute_ops(root, pane_id, focus_ratio=DEFAULT_RATIO, eps=0.005):
-    """Return [(path, ratio)] to apply, root first, for splits on root->pane.
+def count_leaves(node):
+    if node.get("type") == "pane":
+        return 1
+    return count_leaves(node["first"]) + count_leaves(node["second"])
 
-    Splits already within `eps` of the target are skipped. Returns [] when the
-    pane is not in the tree or the tree is a single pane.
+
+def _balance_ops(node, path, ops, eps):
+    """Splits in an off-path subtree: ratio = leaves(first)/leaves(total)."""
+    if node.get("type") != "split":
+        return
+    target = count_leaves(node["first"]) / float(count_leaves(node))
+    if abs(float(node["ratio"]) - target) > eps:
+        ops.append((list(path), round(target, 4)))
+    _balance_ops(node["first"], path + [False], ops, eps)
+    _balance_ops(node["second"], path + [True], ops, eps)
+
+
+def compute_ops(root, pane_id, focus_ratio=DEFAULT_RATIO, eps=0.005, balance_others=True):
+    """Return [(path, ratio)] to apply, root first.
+
+    Splits on root->pane get `focus_ratio` for the focused side. With
+    `balance_others`, every other split (off-path subtrees) is set so all
+    their leaves get equal size. Splits already within `eps` are skipped.
+    Returns [] when the pane is not in the tree or the tree is a single pane.
     """
     focus_ratio = clamp_ratio(focus_ratio)
     if not contains_pane(root, pane_id):
@@ -47,6 +66,9 @@ def compute_ops(root, pane_id, focus_ratio=DEFAULT_RATIO, eps=0.005):
         target = focus_ratio if in_first else 1.0 - focus_ratio
         if abs(float(node["ratio"]) - target) > eps:
             ops.append((list(path), round(target, 4)))
+        if balance_others:
+            other = node["second"] if in_first else node["first"]
+            _balance_ops(other, path + [in_first], ops, eps)
         path.append(not in_first)
         node = node["first"] if in_first else node["second"]
     return ops

@@ -61,6 +61,28 @@ def load_ratio():
     return core.DEFAULT_RATIO
 
 
+def load_balance():
+    env = os.environ.get("HERDR_SMART_FOCUS_BALANCE")
+    if env:
+        return env.strip().lower() not in ("0", "false", "no", "off")
+    cfg_dir = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+    if cfg_dir:
+        try:
+            with open(os.path.join(cfg_dir, "config.toml"), "r", encoding="utf-8") as fh:
+                text = fh.read()
+            try:
+                import tomllib
+                return bool(tomllib.loads(text).get("balance_others", True))
+            except ImportError:
+                for line in text.splitlines():
+                    k, _, v = line.partition("=")
+                    if k.strip() == "balance_others":
+                        return v.split("#")[0].strip().lower() not in ("false", "0", "no", "off")
+        except (OSError, ValueError):
+            pass
+    return True
+
+
 def _state_file():
     return os.path.join(state_dir(), "tabs.json")
 
@@ -133,7 +155,7 @@ class Daemon:
         if tab_id not in load_enabled() or layout.get("zoomed"):
             return
         pane_id = force_pane or layout.get("focused_pane_id")
-        ops = core.compute_ops(root, pane_id, load_ratio())
+        ops = core.compute_ops(root, pane_id, load_ratio(), balance_others=load_balance())
         if not ops:
             return
         self.suppress[tab_id] = time.monotonic() + SELF_SUPPRESS_S
@@ -331,7 +353,8 @@ def cmd_toggle_like(action):
     if want:  # apply right away for the current focus
         try:
             layout = export_layout(tab_id=tab)
-            ops = core.compute_ops(layout["root"], layout.get("focused_pane_id"), load_ratio())
+            ops = core.compute_ops(layout["root"], layout.get("focused_pane_id"), load_ratio(),
+                                   balance_others=load_balance())
             for path, ratio in ops:
                 request("layout.set_split_ratio", {"tab_id": tab, "path": path, "ratio": ratio})
         except HerdrError as exc:
@@ -343,6 +366,7 @@ def cmd_status():
     tab = resolve_tab()
     info = {"daemon_pid": daemon_pid(), "tab_id": tab,
             "tab_enabled": tab in load_enabled(), "focus_ratio": load_ratio(),
+            "balance_others": load_balance(),
             "enabled_tabs": sorted(load_enabled()), "state_dir": state_dir()}
     out = json.dumps(info, indent=2)
     print(out)

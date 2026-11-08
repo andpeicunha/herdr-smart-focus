@@ -1,6 +1,6 @@
 # herdr-smart-focus
 
-Herdr plugin (**beta**, `0.1.0-beta`). When focus moves to a pane, that pane
+Herdr plugin (**beta**, `0.2.0-beta`). When focus moves to a pane, that pane
 grows to ~70% (`focus_ratio`) along every split on the path root -> pane. It
 only calls `layout.export` and `layout.set_split_ratio`, so panes and their
 processes are never recreated, swapped or moved (no `layout.apply`,
@@ -46,6 +46,11 @@ description = "smart focus toggle"
 
 - `focus_ratio` in `$HERDR_PLUGIN_CONFIG_DIR/config.toml` (see
   `herdr plugin config-dir andpeicunha.smart-focus`), default `0.70`.
+- `balance_others` (bool, default `true`): splits off the focus path are set
+  to `leaves(first)/leaves(total)`, so all unfocused panes of a subtree get
+  equal size (`A | (B/C/D)`: focus A -> B,C,D 1/3 each; focus C -> C 70% of the
+  column, B and D equal). `false` leaves off-path splits untouched (0.1
+  behavior). Env override: `HERDR_SMART_FOCUS_BALANCE=0|1`.
 - `HERDR_SMART_FOCUS_RATIO` env var overrides it (read by the daemon at
   start of the daemon's environment).
 - Values are clamped to 0.5..0.9.
@@ -67,6 +72,6 @@ Python 3 stdlib only. Platforms: linux, macos.
 - The 70% applies **per split axis** along the path, not per screen area.
   In deep or mixed-axis trees the focused pane's area share is the product of
   the ratios of the splits it sits in.
-- Other splits on the path are changed too, so siblings shrink; splits off the
-  path are untouched.
+- Other splits on the path are changed too, so siblings shrink; off-path
+  splits are rebalanced by leaf count unless `balance_others = false`.
 - Beta: tested on herdr 0.9.5 only.
