@@ -1,6 +1,6 @@
 # herdr-smart-focus
 
-Herdr plugin (**beta**, `0.3.1-beta`). When focus moves to a pane, that pane
+Herdr plugin (**beta**, `0.4.0-beta`). When focus moves to a pane, that pane
 grows to ~70% (`focus_ratio`) along every split on the path root -> pane.
 With the default `layout = "keep"` it only calls `layout.export` and
 `layout.set_split_ratio`, so panes are never swapped or moved. The optional
@@ -69,6 +69,35 @@ description = "smart focus toggle"
   (`focus_ratio`/`balance_others` only apply to `keep`.)
 - Env overrides are read from the daemon's environment at start.
 
+## Auto rename
+
+`auto_rename` (bool, default `true`; env `HERDR_SMART_FOCUS_AUTO_RENAME=0|1`).
+When smart focus is turned **on** for a tab (`enable`, or `toggle` to on),
+panes without a manual name get the name of their repo:
+
+- name = basename of `git -C <cwd> rev-parse --show-toplevel`; not a git work
+  tree -> basename of the pane cwd.
+- Linked worktrees (e.g. `<repo>/.worktrees/<x>`) use the **main** repo name:
+  basename of the parent of `--git-common-dir` (`<repo>/.git`).
+- Duplicates in the tab get ` #2`, ` #3`, ... in layout reading order.
+- Triggers: (1) smart focus turned on for the tab (all unnamed panes);
+  (2) `pane.created` in an already enabled tab: only the new pane is named,
+  once, taking the first free name (`repo`, `repo #2`, ...) given the other
+  labels in the tab; existing panes are not renamed. If its cwd is not known
+  yet, it is retried once after ~1 s. No rename on `pane.focused` and no
+  periodic cwd re-check (a `cd` later does not rename).
+- Manual names are never overwritten. Herdr exposes a manual name as the
+  non-null `label` of `pane.list`/`pane.get` (detected agents show up in
+  `agent`/`terminal_title`, `label` stays `null`). The plugin records what it
+  applied in `names.json` (state dir, `{pane_id: name}`) and only renames a
+  pane whose current `label` is empty (never named by us) or still equals the
+  recorded name. If you rename it afterwards, the plugin releases that pane.
+- Disabling smart focus keeps the names (nothing is cleared). Clear one with
+  `herdr pane rename <pane> --clear`.
+- Only `pane.rename` is used (never send-text/send-keys).
+- Pure logic: `smart_focus_core.repo_display_name`, `dedupe_names`,
+  `should_manage`, `plan_renames`.
+
 ## Stack layouts
 
 - `stack-bottom`: the unfocused panes sit side by side in equal parts on top;
@@ -116,7 +145,7 @@ description = "smart focus toggle"
   mutating call outside that workspace; `HERDR_SMART_FOCUS_FAULT=<point>:<n>:<raise|kill|term>`
   injects failures (`move_out_parse`, `after_move_out`, `after_move_in`).
 
-State (`tabs.json`, `daemon.lock`, `daemon.log`) lives in
+State (`tabs.json`, `names.json`, `daemon.lock`, `daemon.log`) lives in
 `$HERDR_PLUGIN_STATE_DIR` (fallback `~/.local/state/herdr-smart-focus`).
 
 ## Develop

@@ -365,3 +365,97 @@ class FailureTracker:
 
     def count(self, key):
         return self.counts.get(key, 0)
+
+
+# ---------- auto rename (pure) ----------
+
+def parse_bool(value, default=True):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    v = str(value).strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return False
+    if v in ("1", "true", "yes", "on"):
+        return True
+    return default
+
+
+def repo_display_name(cwd, toplevel=None, common_dir=None):
+    """Name for a pane from git facts (callers pass absolute, resolved paths).
+
+    Linked worktrees (e.g. `<repo>/.worktrees/x`) share the main repo's
+    `--git-common-dir` (`<repo>/.git`), so they get the main repo's name.
+    Not a git work tree -> basename of cwd.
+    """
+    def base(p):
+        return (p or "").rstrip("/").rsplit("/", 1)[-1]
+
+    if common_dir and toplevel:
+        c = common_dir.rstrip("/")
+        name = base(c.rsplit("/", 1)[0]) if base(c) == ".git" else base(c)
+        if name.endswith(".git") and len(name) > 4:
+            name = name[:-4]
+        if name:
+            return name
+    return base(toplevel) or base(cwd) or "pane"
+
+
+def dedupe_names(names):
+    """['a','b','a','a'] -> ['a','b','a #2','a #3'] (order preserved)."""
+    seen, out = {}, []
+    for n in names:
+        seen[n] = seen.get(n, 0) + 1
+        out.append(n if seen[n] == 1 else "%s #%d" % (n, seen[n]))
+    return out
+
+
+def should_manage(label, applied_name):
+    """May the plugin touch this pane's name?
+
+    label: current manual label from herdr (None/"" = no manual name).
+    applied_name: what the plugin last applied to this pane (None = never).
+    Managed only if the pane never had a name set by us and has no manual
+    label, or its label is still exactly what we applied.
+    """
+    if applied_name is None:
+        return not label
+    return label == applied_name
+
+
+def plan_renames(panes, applied):
+    """panes: [{"pane_id", "label", "base"}] in reading order.
+    applied: {pane_id: name} previously applied by the plugin.
+    Returns (renames {pane_id: name}, new_applied). Panes the user renamed
+    (label != applied) are released: no rename and dropped from the record.
+    Records of panes outside `panes` (other tabs) are kept untouched; use
+    prune_applied to drop closed panes."""
+    managed = [p for p in panes if should_manage(p.get("label"), applied.get(p["pane_id"]))]
+    names = dedupe_names([p["base"] for p in managed])
+    renames, new_applied = {}, {}
+    seen = {p["pane_id"] for p in panes}
+    for k, v in applied.items():
+        if k not in seen:
+            new_applied[k] = v  # other tabs; pruned separately
+    for p, name in zip(managed, names):
+        new_applied[p["pane_id"]] = name
+        if p.get("label") != name:
+            renames[p["pane_id"]] = name
+    return renames, new_applied
+
+
+def name_for_new(base, taken):
+    """Name for ONE newly created pane: `base`, or the first free
+    `base #n` (n>=2) given the names `taken` by the other panes of the tab."""
+    taken = set(taken)
+    if base not in taken:
+        return base
+    n = 2
+    while "%s #%d" % (base, n) in taken:
+        n += 1
+    return "%s #%d" % (base, n)
+
+
+def prune_applied(applied, live_ids):
+    return {k: v for k, v in applied.items() if k in live_ids}

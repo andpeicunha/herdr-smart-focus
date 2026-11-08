@@ -24,6 +24,7 @@ FAIL_LIMIT = 3  # consecutive failed stack applies before a tab is disabled
 DEBOUNCE_S = 0.08
 SELF_SUPPRESS_S = 0.5
 RECONNECT_GIVEUP_S = 60
+RENAME_RETRY_S = 1.0
 SUBSCRIPTIONS = ["pane.focused", "pane.created", "pane.closed", "layout.updated", "tab.focused"]
 
 
@@ -135,6 +136,11 @@ def load_balance():
     return True
 
 
+def load_auto_rename():
+    env = os.environ.get("HERDR_SMART_FOCUS_AUTO_RENAME")
+    return core.parse_bool(env if env else read_config().get("auto_rename", True))
+
+
 def _state_file():
     return os.path.join(state_dir(), "tabs.json")
 
@@ -152,6 +158,27 @@ def save_enabled(tabs):
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump({"enabled": sorted(tabs)}, fh)
     os.replace(tmp, _state_file())
+
+
+def _names_file():
+    return os.path.join(state_dir(), "names.json")
+
+
+def load_names():
+    """{pane_id: name} the plugin itself applied via pane.rename."""
+    try:
+        with open(_names_file(), "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        return {k: v for k, v in d.items() if isinstance(k, str) and isinstance(v, str)}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def save_names(names):
+    tmp = _names_file() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(names, fh)
+    os.replace(tmp, _names_file())
 
 
 # ---------- herdr socket ----------
@@ -233,6 +260,77 @@ def notify(title, body=""):
         request("notification.show", {"title": title, "body": body})
     except Exception:
         pass
+
+
+# ---------- auto rename ----------
+
+def git_facts(cwd):
+    """(toplevel, common_dir) as absolute real paths; (None, None) outside a work tree."""
+    try:
+        r = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel", "--git-common-dir"],
+                           capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    lines = r.stdout.splitlines()
+    if r.returncode != 0 or len(lines) < 2:
+        return None, None
+    return (os.path.realpath(lines[0]),
+            os.path.realpath(os.path.join(cwd, lines[1])))
+
+
+def _pane_base(p):
+    cwd = p.get("cwd") or ""
+    top, common = git_facts(cwd) if cwd else (None, None)
+    return core.repo_display_name(cwd, top, common)
+
+
+def auto_rename_tab(tab_id, order, log):
+    """Enable/toggle-on trigger: name every unnamed pane of `tab_id` after its
+    repo. `order` = pane ids in reading order. Only pane.rename is used;
+    manual names are never touched."""
+    panes = {p["pane_id"]: p for p in request("pane.list")["panes"]}
+    infos = []
+    for pid in order:
+        p = panes.get(pid)
+        if p and p.get("tab_id") == tab_id:
+            infos.append({"pane_id": pid, "label": p.get("label"), "base": _pane_base(p)})
+    applied = core.prune_applied(load_names(), set(panes))
+    renames, new_applied = core.plan_renames(infos, applied)
+    for pid, name in renames.items():
+        try:
+            request("pane.rename", {"pane_id": pid, "label": name})
+        except RECOVERABLE as exc:
+            log("pane.rename %s failed: %s" % (pid, exc))
+            new_applied.pop(pid, None)
+    save_names(new_applied)
+    if renames:
+        log("auto_rename %s: %s" % (tab_id, renames))
+
+
+def auto_rename_new_pane(pane_id, log):
+    """pane.created trigger: name ONLY this pane, once; others are untouched.
+    Returns "retry" when the cwd is not known yet, else None."""
+    panes = {p["pane_id"]: p for p in request("pane.list")["panes"]}
+    p = panes.get(pane_id)
+    if not p or p.get("tab_id") not in load_enabled():
+        return None
+    applied = core.prune_applied(load_names(), set(panes))
+    if not core.should_manage(p.get("label"), applied.get(pane_id)):
+        return None
+    if not p.get("cwd"):
+        return "retry"
+    taken = [q.get("label") for q in panes.values()
+             if q.get("tab_id") == p["tab_id"] and q["pane_id"] != pane_id and q.get("label")]
+    name = core.name_for_new(_pane_base(p), taken)
+    try:
+        request("pane.rename", {"pane_id": pane_id, "label": name})
+    except RECOVERABLE as exc:
+        log("pane.rename %s failed: %s" % (pane_id, exc))
+        return None
+    applied[pane_id] = name
+    save_names(applied)
+    log("auto_rename new pane %s: %s" % (pane_id, name))
+    return None
 
 
 # ---------- applying a layout ----------
@@ -615,6 +713,7 @@ class Daemon:
 
     def handle_batch(self, events):
         focus_panes, layout_tabs, any_tab_focus, requested = [], [], False, False
+        new_panes = []
         for name, data, ts in events:
             if name == "pane_focused" and data.get("pane_id"):
                 start, end, panes = self.echo
@@ -631,10 +730,14 @@ class Daemon:
                 tab_id = (data.get("layout") or {}).get("tab_id") or data.get("tab_id")
                 if tab_id:
                     layout_tabs.append(tab_id)
+            elif name == "rename_retry":
+                new_panes.append((data.get("pane_id"), True))
             elif name == "pane_created":
                 pane = data.get("pane") or {}
                 pid = pane.get("pane_id") or data.get("pane_id")
                 tab_id = pane.get("tab_id") or data.get("tab_id")
+                if pid:
+                    new_panes.append((pid, False))
                 if tab_id:
                     layout_tabs.append(tab_id)
                 elif pid:
@@ -648,7 +751,24 @@ class Daemon:
                     self.log("apply request %s failed: %s" % (tab_id, exc))
                     continue
                 done_tabs.add(tab_id)
+                if tab_id in load_enabled() and load_auto_rename():
+                    try:  # only on enable/toggle-on; no other trigger
+                        auto_rename_tab(tab_id, core.leaves(layout["root"]), self.log)
+                    except RECOVERABLE as exc:
+                        self.log("auto_rename %s failed: %s" % (tab_id, exc))
                 self.apply_for(layout)
+        if new_panes and load_auto_rename():
+            for pid, is_retry in dict.fromkeys(new_panes):
+                try:
+                    res = auto_rename_new_pane(pid, self.log)
+                except RECOVERABLE as exc:
+                    self.log("auto_rename %s failed: %s" % (pid, exc))
+                    continue
+                if res == "retry" and not is_retry:  # cwd not set yet: one more try
+                    t = threading.Timer(RENAME_RETRY_S, self.q.put,
+                                        (("rename_retry", {"pane_id": pid}, time.monotonic()),))
+                    t.daemon = True
+                    t.start()
         if focus_panes:
             pane_id = focus_panes[-1]
             try:
@@ -863,7 +983,7 @@ def cmd_status():
     info = {"daemon_pid": daemon_pid(), "tab_id": tab,
             "tab_enabled": tab in load_enabled(), "focus_ratio": load_ratio(),
             "layout": load_layout(), "stack_ratio": load_stack_ratio(),
-            "balance_others": load_balance(),
+            "balance_others": load_balance(), "auto_rename": load_auto_rename(),
             "enabled_tabs": sorted(load_enabled()), "state_dir": state_dir()}
     out = json.dumps(info, indent=2)
     print(out)
