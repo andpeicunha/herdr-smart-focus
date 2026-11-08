@@ -1,0 +1,33 @@
+id = "andpeicunha.smart-focus"
+name = "smart-focus"
+version = "0.1.0-beta"
+min_herdr_version = "0.9.5"
+platforms = ["macos", "linux"]
+description = "Grow the focused pane to ~70% on each split axis of its path, without recreating panes or processes."
+
+[[startup]]
+command = ["python3", "bin/smart_focus.py", "ensure"]
+
+[[actions]]
+id = "toggle"
+title = "smart focus: toggle for this tab"
+contexts = ["pane", "tab", "global"]
+command = ["python3", "bin/smart_focus.py", "toggle"]
+
+[[actions]]
+id = "enable"
+title = "smart focus: enable for this tab"
+contexts = ["pane", "tab", "global"]
+command = ["python3", "bin/smart_focus.py", "enable"]
+
+[[actions]]
+id = "disable"
+title = "smart focus: disable for this tab"
+contexts = ["pane", "tab", "global"]
+command = ["python3", "bin/smart_focus.py", "disable"]
+
+[[actions]]
+id = "status"
+title = "smart focus: status"
+contexts = ["pane", "tab", "global"]
+command = ["python3", "bin/smart_focus.py", "status"]
