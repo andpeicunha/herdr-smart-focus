@@ -1,6 +1,6 @@
 id = "andpeicunha.smart-focus"
 name = "smart-focus"
-version = "0.3.0-beta"
+version = "0.3.1-beta"
 min_herdr_version = "0.9.5"
 platforms = ["macos", "linux"]
 description = "Grow the focused pane to ~70% on each split axis of its path and balance the other panes equally, without recreating panes or processes. Optional stack-bottom / stack-right layouts."

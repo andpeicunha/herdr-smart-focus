@@ -1,6 +1,6 @@
 # herdr-smart-focus
 
-Herdr plugin (**beta**, `0.3.0-beta`). When focus moves to a pane, that pane
+Herdr plugin (**beta**, `0.3.1-beta`). When focus moves to a pane, that pane
 grows to ~70% (`focus_ratio`) along every split on the path root -> pane.
 With the default `layout = "keep"` it only calls `layout.export` and
 `layout.set_split_ratio`, so panes are never swapped or moved. The optional
@@ -91,6 +91,30 @@ description = "smart focus toggle"
 - Planning is a pure function:
   `smart_focus_core.plan_stack(tree, focused, mode, stack_ratio)` ->
   `[("swap"|"move_out"|"move_in"|"focus"|"ratio", ...)]`.
+
+## Safety and recovery (stack layouts)
+
+- Write-ahead journal (`journal.json` in the state dir): before any pane is
+  moved to the scratch tab it records home tab, anchor pane and the original
+  reading order. It is deleted once every pane is back.
+- Every rebuild runs under `try/finally`: any error (timeout, bad JSON,
+  socket error) triggers recovery. If the scratch tab id was never parsed,
+  the tab is found by its `smart-focus-tmp` label inside the same workspace.
+  Only panes listed in the journal are ever moved back.
+- Recovery also runs at daemon startup (covers `kill -9`/crash), before each
+  rebuild, and on SIGTERM/SIGINT (the running rebuild stops between ops and
+  restores the panes before exit).
+- `toggle`/`enable` only write state and ask the daemon (`apply.request` +
+  SIGUSR1); the CLI never moves panes, so there is no concurrent rebuild.
+- The scratch tab alternates split directions (avoids minimum-size failures).
+- A failed stack apply raises a notification and counts toward a per-tab
+  backoff: 3 consecutive failures disable smart focus for that tab.
+- A swap skipped because the tab is not focused aborts the rest of that plan.
+  The final focus is not forced when the tab is hidden (it is applied when the
+  tab is shown) or when you focused another pane during the rebuild.
+- Test hooks: `HERDR_SMART_FOCUS_WS_PREFIX=<workspace id>` refuses any
+  mutating call outside that workspace; `HERDR_SMART_FOCUS_FAULT=<point>:<n>:<raise|kill|term>`
+  injects failures (`move_out_parse`, `after_move_out`, `after_move_in`).
 
 State (`tabs.json`, `daemon.lock`, `daemon.log`) lives in
 `$HERDR_PLUGIN_STATE_DIR` (fallback `~/.local/state/herdr-smart-focus`).

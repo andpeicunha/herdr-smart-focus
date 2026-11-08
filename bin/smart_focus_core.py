@@ -278,3 +278,90 @@ def plan_stack(root, focused, mode, stack_ratio=DEFAULT_STACK_RATIO, eps=0.005):
     target = build_stack_tree(strip, focused, mode)
     ops += [("ratio", p, r) for p, r in stack_ratio_ops(target, stack_ratio, mode, force=True)]
     return ops
+
+
+# ---------- safety: journal / recovery / backoff / scope (pure) ----------
+
+def ops_panes(ops):
+    """Every pane id a stack plan touches (swap / move / focus)."""
+    out = set()
+    for op in ops:
+        if op[0] == "swap":
+            out.update((op[1], op[2]))
+        elif op[0] in ("move_out", "focus"):
+            out.add(op[1])
+        elif op[0] == "move_in":
+            out.update((op[1], op[3]))
+    return out
+
+
+def journal_for(tab_id, root, ops):
+    """Write-ahead record for a plan that moves panes out of the tab; None
+    when the plan never leaves the tab (swap / ratio only)."""
+    outs = [op[1] for op in ops if op[0] == "move_out"]
+    if not outs:
+        return None
+    order = leaves(root)
+    anchor = next((op[3] for op in ops if op[0] == "move_in"), None)
+    if anchor is None:  # anchor = first pane that never leaves
+        anchor = next((p for p in order if p not in outs), order[0])
+    return {"tab": tab_id, "anchor": anchor, "order": order, "tmp_tab": None, "attempts": 0}
+
+
+def tmp_split(index):
+    """Direction for the index-th pane (>=1) parked in the scratch tab.
+    Alternating avoids a long same-direction chain hitting herdr's minimum
+    pane size."""
+    return "right" if index % 2 == 1 else "down"
+
+
+def recovery_moves(order, anchor, stranded, home):
+    """[(pane, split, target)] bringing stranded panes back to the home tab.
+    Only panes listed in the journal `order` are ever moved. Each pane goes
+    next to the nearest preceding pane (original reading order) already
+    present; direction alternates to keep sizes viable."""
+    pos = {p: i for i, p in enumerate(order)}
+    todo = sorted((p for p in stranded if p in pos), key=lambda p: pos[p])
+    present = list(home)
+    base = anchor if anchor in present else (present[0] if present else None)
+    if base is None:
+        return []
+    moves = []
+    for n, p in enumerate(todo):
+        target = base
+        for q in reversed(order[:pos[p]]):
+            if q in present:
+                target = q
+                break
+        moves.append((p, "right" if n % 2 == 0 else "down", target))
+        present.append(p)
+    return moves
+
+
+def parse_requests(text):
+    """Apply-request file -> ordered unique tab ids."""
+    seen = []
+    for line in (text or "").splitlines():
+        t = line.strip()
+        if t and t not in seen:
+            seen.append(t)
+    return seen
+
+
+class FailureTracker:
+    """Consecutive failures per key; `fail` returns True at the limit."""
+
+    def __init__(self, limit=3):
+        self.limit = limit
+        self.counts = {}
+
+    def fail(self, key):
+        n = self.counts.get(key, 0) + 1
+        self.counts[key] = n
+        return n >= self.limit
+
+    def ok(self, key):
+        self.counts.pop(key, None)
+
+    def count(self, key):
+        return self.counts.get(key, 0)

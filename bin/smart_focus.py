@@ -10,6 +10,7 @@ import fcntl
 import json
 import os
 import queue
+import signal
 import socket
 import subprocess
 import sys
@@ -19,6 +20,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import smart_focus_core as core  # noqa: E402
 
+FAIL_LIMIT = 3  # consecutive failed stack applies before a tab is disabled
 DEBOUNCE_S = 0.08
 SELF_SUPPRESS_S = 0.5
 RECONNECT_GIVEUP_S = 60
@@ -158,7 +160,54 @@ class HerdrError(Exception):
     pass
 
 
+READ_ONLY = ("layout.export", "tab.list", "tab.get", "pane.list", "pane.get", "workspace.list",
+             "workspace.get", "notification.show", "events.subscribe")
+
+
+def _ids(obj, out):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k.endswith(("pane_id", "tab_id", "workspace_id")) and isinstance(v, str):
+                out.append(v)
+            else:
+                _ids(v, out)
+    return out
+
+
+def _guard(method, params):
+    """Optional scope guard (HERDR_SMART_FOCUS_WS_PREFIX=<workspace id>): every
+    mutating call must target ids inside that workspace. Used by the test
+    harness so a bug can never touch another workspace."""
+    prefix = os.environ.get("HERDR_SMART_FOCUS_WS_PREFIX")
+    if not prefix or method in READ_ONLY:
+        return
+    ids = _ids(params or {}, [])
+    if not ids or any(i != prefix and not i.startswith(prefix + ":") for i in ids):
+        raise HerdrError("scope guard: %s refused for %r" % (method, ids))
+
+
+_fault_counts = {}
+
+
+def _fault(point, count=None):
+    """Test hook: HERDR_SMART_FOCUS_FAULT=<point>:<nth>:<raise|kill|term>."""
+    spec = os.environ.get("HERDR_SMART_FOCUS_FAULT")
+    if not spec:
+        return
+    name, _, rest = spec.partition(":")
+    nth, _, mode = rest.partition(":")
+    if name != point or count != int(nth or 1):
+        return
+    if mode == "kill":
+        os.kill(os.getpid(), signal.SIGKILL)
+    if mode == "term":
+        os.kill(os.getpid(), signal.SIGTERM)
+        return
+    raise OSError("injected fault at %s #%s" % (point, count))
+
+
 def request(method, params=None, timeout=5):
+    _guard(method, params)
     s = socket.socket(socket.AF_UNIX)
     s.settimeout(timeout)
     try:
@@ -189,6 +238,45 @@ def notify(title, body=""):
 # ---------- applying a layout ----------
 
 TMP_TAB_LABEL = "smart-focus-tmp"
+RECOVERABLE = (HerdrError, OSError, ValueError, KeyError, IndexError, TypeError)
+MAX_RECOVERY_ATTEMPTS = 5
+
+
+class _Aborted(Exception):
+    pass
+
+
+def _journal_path():
+    return os.path.join(state_dir(), "journal.json")
+
+
+def journal_exists():
+    return os.path.exists(_journal_path())
+
+
+def journal_read():
+    try:
+        with open(_journal_path(), "r", encoding="utf-8") as fh:
+            j = json.load(fh)
+        return j if isinstance(j, dict) and j.get("tab") and j.get("order") else None
+    except (OSError, ValueError):
+        return None
+
+
+def journal_write(j):
+    tmp = _journal_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(j, fh)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, _journal_path())
+
+
+def journal_clear():
+    try:
+        os.unlink(_journal_path())
+    except OSError:
+        pass
 
 
 def tab_is_focused(tab_id):
@@ -196,62 +284,175 @@ def tab_is_focused(tab_id):
         for t in request("tab.list")["tabs"]:
             if t.get("tab_id") == tab_id:
                 return bool(t.get("focused"))
-    except (HerdrError, KeyError, OSError):
+    except RECOVERABLE:
         pass
     return False
 
 
-def _recover(tab_id, tmp, log):
-    """Best effort: bring panes stranded in the scratch tab back."""
-    try:
-        stranded = core.leaves(export_layout(tab_id=tmp)["root"])
-        anchor = core.leaves(export_layout(tab_id=tab_id)["root"])[0]
-    except (HerdrError, KeyError, IndexError, OSError):
-        return
-    for p in stranded:
+def _move_back(pane, split, target, log):
+    for sp in (split, "down" if split == "right" else "right"):
         try:
-            request("pane.move", {"pane_id": p, "focus": False, "destination": {
-                "type": "tab", "tab_id": tab_id, "split": "right", "target_pane_id": anchor}})
-        except HerdrError as exc:
-            log("recover failed %s: %s" % (p, exc))
+            request("pane.move", {"pane_id": pane, "focus": False, "destination": {
+                "type": "tab", "tab_id": target[0], "split": sp, "target_pane_id": target[1]}})
+            return True
+        except RECOVERABLE as exc:
+            log("recover move %s failed (%s): %s" % (pane, sp, exc))
+    return False
 
 
-def run_stack_ops(tab_id, ops, log):
-    """Execute core.plan_stack ops. Returns the pane to expect a pane.focused for."""
+def recover_journal(journal, log):
+    """Bring panes of `journal` stranded in the scratch tab back to the home
+    tab. Returns (clean, recovered): clean = nothing left stranded (journal
+    can be dropped). Only panes listed in the journal are ever moved."""
+    home = journal["tab"]
+    ws = home.split(":")[0]
+    try:
+        tabs = request("tab.list")["tabs"]
+    except RECOVERABLE as exc:
+        log("recover: tab.list failed: %s" % exc)
+        return False, 0
+    if not any(t.get("tab_id") == home for t in tabs):
+        log("recover: home tab %s is gone; leaving scratch tab as is" % home)
+        return True, 0
+    cands = [t["tab_id"] for t in tabs if t.get("workspace_id") == ws and t.get("tab_id") != home
+             and (t.get("tab_id") == journal.get("tmp_tab") or t.get("label") == TMP_TAB_LABEL)]
+    stranded = []
+    for tab in cands:
+        try:
+            stranded += core.leaves(export_layout(tab_id=tab)["root"])
+        except RECOVERABLE as exc:
+            log("recover: scratch tab %s unreadable: %s" % (tab, exc))
+    stranded = [p for p in stranded if p in journal["order"]]
+    if not stranded:
+        return True, 0
+    try:
+        home_panes = core.leaves(export_layout(tab_id=home)["root"])
+    except RECOVERABLE as exc:
+        log("recover: home export failed: %s" % exc)
+        return False, 0
+    clean, n = True, 0
+    for pane, split, target in core.recovery_moves(journal["order"], journal.get("anchor"),
+                                                   stranded, home_panes):
+        if _move_back(pane, split, (home, target), log):
+            n += 1
+        else:
+            clean = False
+    log("recover: %s moved back %d/%d pane(s) to %s" % ("ok" if clean else "PARTIAL", n, len(stranded), home))
+    return clean, n
+
+
+def recover_pending(log):
+    """Recover from the journal (startup / before each rebuild / shutdown)."""
+    j = journal_read()
+    if not j:
+        if journal_exists():
+            journal_clear()  # unreadable journal: nothing actionable
+        return 0
+    clean, n = recover_journal(j, log)
+    if clean:
+        journal_clear()
+    else:
+        j["attempts"] = j.get("attempts", 0) + 1
+        if j["attempts"] >= MAX_RECOVERY_ATTEMPTS:
+            log("recover: giving up after %d attempts; panes may remain in the %s tab" % (
+                j["attempts"], TMP_TAB_LABEL))
+            notify("smart focus", "could not restore panes; check the %s tab" % TMP_TAB_LABEL)
+            journal_clear()
+        else:
+            journal_write(j)
+    if n:
+        notify("smart focus", "recovered %d pane(s) after an interrupted rebuild" % n)
+    return n
+
+
+def run_stack_ops(tab_id, ops, log, journal=None, abort=None):
+    """Execute core.plan_stack ops. Panes moved to the scratch tab are always
+    brought back (try/finally, journal-backed). Returns a dict:
+    expect (pane to expect a pane.focused for), failed, skipped, refocus."""
+    out = {"expect": None, "failed": False, "skipped": False, "refocus": None, "deferred": None}
     tmp = last_out = None
-    expect = None
+    n_out = 0
+    anchor = journal["anchor"] if journal else None
+    if journal:
+        journal_write(journal)  # write-ahead: before any pane leaves the tab
     try:
         for op in ops:
+            if abort and abort():
+                raise _Aborted()
             kind = op[0]
             if kind == "swap":
                 if not tab_is_focused(tab_id):
-                    continue  # pane.swap focuses the tab; don't steal the view
+                    # pane.swap focuses the tab; don't steal the view. State is
+                    # stale now, so drop the rest of this plan.
+                    out["skipped"] = True
+                    break
                 request("pane.swap", {"source_pane_id": op[1], "target_pane_id": op[2]})
-                expect = op[1]
+                out["expect"] = op[1]
             elif kind == "move_out":
-                dest = ({"type": "new_tab", "label": TMP_TAB_LABEL} if tmp is None else
-                        {"type": "tab", "tab_id": tmp, "split": "right", "target_pane_id": last_out})
+                dest = ({"type": "new_tab", "label": TMP_TAB_LABEL} if n_out == 0 else
+                        {"type": "tab", "tab_id": tmp, "split": core.tmp_split(n_out),
+                         "target_pane_id": last_out})
                 res = request("pane.move", {"pane_id": op[1], "destination": dest, "focus": False})
-                tmp = tmp or res["move_result"]["pane"]["tab_id"]
+                n_out += 1
+                _fault("move_out_parse", n_out)  # response lost after the move happened
+                if tmp is None:
+                    tmp = res["move_result"]["pane"]["tab_id"]
+                    if journal:
+                        journal["tmp_tab"] = tmp
+                        journal_write(journal)
                 last_out = op[1]
+                _fault("after_move_out", n_out)
             elif kind == "move_in":
                 request("pane.move", {"pane_id": op[1], "focus": False, "destination": {
                     "type": "tab", "tab_id": tab_id, "split": op[2], "target_pane_id": op[3]}})
+                _fault("after_move_in", 1 + sum(1 for o in ops[:ops.index(op)] if o[0] == "move_in"))
             elif kind == "focus":
+                cur = None
+                try:
+                    cur = export_layout(tab_id=tab_id).get("focused_pane_id")
+                except RECOVERABLE:
+                    pass
+                if cur and cur not in (op[1], anchor) and cur in core.ops_panes(ops):
+                    # the user focused another pane meanwhile: respect it
+                    out["refocus"] = cur
+                    log("focus changed by user to %s; skipping final focus" % cur)
+                    continue
+                if not tab_is_focused(tab_id):
+                    out["deferred"] = op[1]  # pane.focus would steal the view; do it on tab focus
+                    continue
                 request("pane.focus", {"pane_id": op[1]})
-                expect = op[1]
+                out["expect"] = op[1]
             elif kind == "ratio":
                 request("layout.set_split_ratio", {"tab_id": tab_id, "path": op[1], "ratio": op[2]})
-    except (HerdrError, KeyError) as exc:
-        log("stack op failed %s: %s" % (tab_id, exc))
-        if tmp:
-            _recover(tab_id, tmp, log)
-    return expect
+    except _Aborted:
+        log("stack ops aborted (shutdown) %s" % tab_id)
+        out["failed"] = True
+    except Exception as exc:  # noqa: BLE001 - recovery below must always run
+        log("stack op failed %s: %r" % (tab_id, exc))
+        out["failed"] = True
+    finally:
+        if journal:
+            if journal.get("tmp_tab") is None and tmp:
+                journal["tmp_tab"] = tmp
+            try:
+                clean, n = recover_journal(journal, log)
+            except Exception as exc:  # noqa: BLE001
+                log("recover crashed: %r" % exc)
+                clean, n = False, 0
+            if clean:
+                journal_clear()
+            else:
+                journal_write(journal)
+            if n or not clean:
+                out["failed"] = True
+    return out
 
 
-def apply_layout(layout, pane_id, log):
-    """Apply the configured mode to an exported layout.
-    Returns (did_something, pane_expected_to_emit_focus)."""
+def apply_layout(layout, pane_id, log, abort=None):
+    """Apply the configured mode to an exported layout. Returns a dict:
+    did, expect, failed, skipped, refocus, panes (panes touched, for echo filtering)."""
+    out = {"did": False, "expect": None, "failed": False, "skipped": False,
+           "refocus": None, "deferred": None, "panes": set()}
     mode = load_layout()
     tab_id = layout["tab_id"]
     if mode == "keep":
@@ -263,23 +464,79 @@ def apply_layout(layout, pane_id, log):
             except HerdrError as exc:
                 log("set_split_ratio failed %s %s: %s" % (tab_id, path, exc))
                 break
-        return bool(ops), None
+        out["did"] = bool(ops)
+        return out
     ops = core.plan_stack(layout["root"], pane_id, mode, load_stack_ratio())
     if not ops:
-        return False, None
+        return out
+    if not core.ops_panes(ops) <= set(core.leaves(layout["root"])):
+        log("refusing plan touching panes outside %s" % tab_id)
+        out["failed"] = True
+        return out
     log("stack %s tab=%s focus=%s ops=%s" % (mode, tab_id, pane_id, [o[0] for o in ops]))
-    return True, run_stack_ops(tab_id, ops, log)
+    journal = core.journal_for(tab_id, layout["root"], ops)
+    res = run_stack_ops(tab_id, ops, log, journal=journal, abort=abort)
+    out.update(res)
+    out["did"] = True
+    out["panes"] = core.ops_panes(ops)
+    return out
+
+
+# ---------- apply requests (CLI -> daemon) ----------
+
+def _request_file():
+    return os.path.join(state_dir(), "apply.request")
+
+
+def request_apply(tab_id):
+    """CLI side: ask the daemon to apply the layout for `tab_id`."""
+    fd = os.open(_request_file(), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, (tab_id + "\n").encode())
+    finally:
+        os.close(fd)
+
+
+def take_apply_requests():
+    taking = _request_file() + ".taking"
+    text = ""
+    for path in (taking, _request_file()):
+        try:
+            if path == _request_file():
+                os.replace(path, taking)
+                path = taking
+            with open(path, "r", encoding="utf-8") as fh:
+                text += fh.read()
+            if path == taking:
+                os.unlink(taking)
+        except OSError:
+            pass
+    return core.parse_requests(text)
 
 
 # ---------- daemon ----------
 
 class Daemon:
     def __init__(self):
-        self.q = queue.Queue()
+        self.q = queue.SimpleQueue()  # reentrant put: safe from signal handlers
         self.shapes = {}       # tab_id -> last seen shape signature
         self.suppress = {}     # tab_id -> monotonic deadline (our own layout.updated)
         self.expect_focus = {}  # pane_id -> deadline (pane.focused caused by our swap/focus)
-        self.op_window = (0.0, 0.0)  # monotonic [start, end] of our last structural ops
+        self.echo = (0.0, 0.0, frozenset())  # (start, end, panes) of our last structural ops
+        self.failures = core.FailureTracker(FAIL_LIMIT)
+        self.deferred = {}     # tab_id -> pane to focus once the tab is shown
+        self.pending = []      # [(tab_id, pane)] re-apply requests (user focused meanwhile)
+        self.stop = False
+        self.critical = False
+
+    # -- signals --
+    def _on_term(self, signum, frame):
+        self.stop = True
+        if not self.critical:
+            raise SystemExit(0)
+
+    def _on_usr1(self, signum, frame):
+        self.q.put(("apply_request", {}, time.monotonic()))
 
     def log(self, msg):
         print("%s %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
@@ -287,39 +544,89 @@ class Daemon:
     # -- applying --
     def apply_for(self, layout, force_pane=None):
         tab_id = layout["tab_id"]
-        root = layout["root"]
-        self.shapes[tab_id] = core.shape_signature(root)
+        self.shapes[tab_id] = core.shape_signature(layout["root"])
         if tab_id not in load_enabled() or layout.get("zoomed"):
             return
+        self.critical = True
+        try:
+            self._apply_for(layout, force_pane)
+        finally:
+            self.critical = False
+            if self.stop:
+                raise SystemExit(0)
+
+    def _apply_for(self, layout, force_pane):
+        tab_id = layout["tab_id"]
+        if load_layout() != "keep" and journal_exists():
+            recover_pending(self.log)  # a previous rebuild never finished
+            try:
+                layout = export_layout(tab_id=tab_id)
+            except (HerdrError, OSError, ValueError, KeyError):
+                return
         pane_id = force_pane or layout.get("focused_pane_id")
+        want = self.deferred.get(tab_id)
+        if want and want in core.leaves(layout["root"]) and tab_is_focused(tab_id):
+            self.deferred.pop(tab_id, None)  # finish a rebuild done while the tab was hidden
+            if layout.get("focused_pane_id") != want:
+                try:
+                    request("pane.focus", {"pane_id": want})
+                    self.expect_focus[want] = time.monotonic() + SELF_SUPPRESS_S
+                except RECOVERABLE as exc:
+                    self.log("deferred focus failed %s: %s" % (want, exc))
+            pane_id = want
         self.suppress[tab_id] = time.monotonic() + SELF_SUPPRESS_S
         started = time.monotonic()
-        did, expect = apply_layout(layout, pane_id, self.log)
-        if did:
-            # pane.focused emitted while we move/swap panes are ours, not the user's
-            self.op_window = (started, time.monotonic() + DEBOUNCE_S * 2)
-        if not did:
+        out = apply_layout(layout, pane_id, self.log, abort=lambda: self.stop)
+        if out["did"]:
+            # pane.focused emitted for panes we move/swap/focus are ours, not the user's
+            self.echo = (started, time.monotonic() + DEBOUNCE_S * 2, frozenset(out["panes"]))
+        if out["failed"]:
+            self.on_failure(tab_id)
+        elif out["did"] and not out["skipped"]:
+            self.failures.ok(tab_id)
+        if out["deferred"]:
+            self.deferred[tab_id] = out["deferred"]
+        if out["refocus"]:
+            self.pending.append((tab_id, out["refocus"]))
+        if not out["did"]:
             self.suppress.pop(tab_id, None)
             return
         try:  # remember the post-op shape so our own changes are not "structural"
             self.shapes[tab_id] = core.shape_signature(export_layout(tab_id=tab_id)["root"])
-        except (HerdrError, KeyError, OSError):
+        except (HerdrError, KeyError, OSError, ValueError):
             self.shapes.pop(tab_id, None)
-        if expect:
-            self.expect_focus[expect] = time.monotonic() + SELF_SUPPRESS_S
+        if out["expect"]:
+            self.expect_focus[out["expect"]] = time.monotonic() + SELF_SUPPRESS_S
         self.suppress[tab_id] = time.monotonic() + SELF_SUPPRESS_S
 
+    def on_failure(self, tab_id):
+        if load_layout() == "keep":
+            return
+        hit = self.failures.fail(tab_id)
+        notify("smart focus", "stack layout failed on %s (%d/%d)" % (
+            tab_id, self.failures.count(tab_id) or FAIL_LIMIT, FAIL_LIMIT))
+        if hit:
+            enabled = load_enabled()
+            enabled.discard(tab_id)
+            save_enabled(enabled)
+            self.failures.ok(tab_id)
+            self.log("tab %s disabled after %d consecutive failures" % (tab_id, FAIL_LIMIT))
+            notify("smart focus", "disabled for %s after %d consecutive failures" % (tab_id, FAIL_LIMIT))
+
     def handle_batch(self, events):
-        focus_panes, layout_tabs, any_tab_focus = [], [], False
+        focus_panes, layout_tabs, any_tab_focus, requested = [], [], False, False
         for name, data, ts in events:
             if name == "pane_focused" and data.get("pane_id"):
-                if self.op_window[0] <= ts <= self.op_window[1]:
-                    continue  # echo of our own move/swap/focus
+                start, end, panes = self.echo
+                if data["pane_id"] in panes and start <= ts <= end:
+                    continue  # echo of our own move/swap/focus of this very pane
                 if time.monotonic() < self.expect_focus.get(data["pane_id"], 0):
                     continue
                 focus_panes.append(data["pane_id"])
             elif name == "tab_focused":
                 any_tab_focus = True
+            elif name == "apply_request":
+                requested = True
             elif name == "layout_updated":
                 tab_id = (data.get("layout") or {}).get("tab_id") or data.get("tab_id")
                 if tab_id:
@@ -333,6 +640,15 @@ class Daemon:
                 elif pid:
                     focus_panes.append(pid)
         done_tabs = set()
+        if requested:  # toggle/enable from the CLI: only the daemon moves panes
+            for tab_id in take_apply_requests():
+                try:
+                    layout = export_layout(tab_id=tab_id)
+                except (HerdrError, OSError, ValueError, KeyError) as exc:
+                    self.log("apply request %s failed: %s" % (tab_id, exc))
+                    continue
+                done_tabs.add(tab_id)
+                self.apply_for(layout)
         if focus_panes:
             pane_id = focus_panes[-1]
             try:
@@ -363,6 +679,15 @@ class Daemon:
             # manual resize and is respected until the next focus change.
             if self.shapes.get(tab_id) != core.shape_signature(layout["root"]):
                 self.apply_for(layout)
+        for _ in range(2):  # user changed focus while we rebuilt: honor it
+            if not self.pending:
+                break
+            tab_id, pane_id = self.pending.pop(0)
+            try:
+                self.apply_for(export_layout(tab_id=tab_id), force_pane=pane_id)
+            except (HerdrError, OSError, ValueError, KeyError) as exc:
+                self.log("re-apply %s failed: %s" % (tab_id, exc))
+        self.pending = []
 
     # -- event stream --
     def reader(self):
@@ -402,8 +727,20 @@ class Daemon:
                 failing_since = None
 
     def run(self):
-        threading.Thread(target=self.reader_loop, daemon=True).start()
+        signal.signal(signal.SIGTERM, self._on_term)
+        signal.signal(signal.SIGINT, self._on_term)
+        signal.signal(signal.SIGUSR1, self._on_usr1)
         self.log("daemon started pid=%d" % os.getpid())
+        self.critical = True
+        try:
+            recover_pending(self.log)  # panes stranded by a crash / kill -9
+        finally:
+            self.critical = False
+        if self.stop:
+            return
+        threading.Thread(target=self.reader_loop, daemon=True).start()
+        if os.path.exists(_request_file()):
+            self.q.put(("apply_request", {}, time.monotonic()))
         while True:
             batch = [self.q.get()]
             while True:  # debounce: wait for DEBOUNCE_S of quiet
@@ -453,10 +790,21 @@ def daemon_pid():
 
 
 def cmd_daemon():
+    signal.signal(signal.SIGUSR1, signal.SIG_IGN)  # before the lock: CLI may signal at once
     lock = acquire_lock()
     if lock is None:
         return 0  # another daemon owns the lock
-    Daemon().run()
+    try:
+        Daemon().run()
+    except SystemExit:
+        pass
+    finally:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, signal.SIG_IGN)  # don't interrupt the final recovery
+        try:
+            recover_pending(lambda m: print(m, flush=True))
+        except Exception:  # noqa: BLE001
+            pass
     return 0
 
 
@@ -496,13 +844,17 @@ def cmd_toggle_like(action):
     msg = "smart focus %s for %s (ratio %.2f)" % ("ON" if want else "OFF", tab, load_ratio())
     print(msg)
     notify("smart focus", msg)
-    if want:  # apply right away for the current focus
-        try:
-            layout = export_layout(tab_id=tab)
-            apply_layout(layout, layout.get("focused_pane_id"),
-                         lambda m: print(m, file=sys.stderr))
-        except HerdrError as exc:
-            print("apply failed: %s" % exc, file=sys.stderr)
+    if want:  # the daemon applies (only it moves panes); CLI just asks
+        request_apply(tab)
+        for _ in range(20):
+            pid = daemon_pid()
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGUSR1)
+                except OSError:
+                    pass
+                break
+            time.sleep(0.1)
     return 0
 
 
