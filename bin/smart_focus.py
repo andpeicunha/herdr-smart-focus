@@ -25,7 +25,9 @@ DEBOUNCE_S = 0.08
 SELF_SUPPRESS_S = 0.5
 RECONNECT_GIVEUP_S = 60
 RENAME_RETRY_S = 1.0
-SUBSCRIPTIONS = ["pane.focused", "pane.created", "pane.closed", "layout.updated", "tab.focused"]
+BADGE_DEBOUNCE_S = 0.3
+SUBSCRIPTIONS = ["pane.focused", "pane.created", "pane.closed", "layout.updated", "tab.focused",
+                 "pane.agent_status_changed"]
 
 
 # ---------- paths / config / state ----------
@@ -141,6 +143,11 @@ def load_auto_rename():
     return core.parse_bool(env if env else read_config().get("auto_rename", True))
 
 
+def load_status_badges():
+    env = os.environ.get("HERDR_SMART_FOCUS_STATUS_BADGES")
+    return core.parse_bool(env if env else read_config().get("status_badges", True))
+
+
 def _state_file():
     return os.path.join(state_dir(), "tabs.json")
 
@@ -179,6 +186,28 @@ def save_names(names):
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(names, fh)
     os.replace(tmp, _names_file())
+
+
+def _badges_file():
+    return os.path.join(state_dir(), "badges.json")
+
+
+def load_badges():
+    """{pane_id: {"base", "applied"}} for panes whose label carries a badge."""
+    try:
+        with open(_badges_file(), "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        return {k: v for k, v in d.items() if isinstance(k, str) and isinstance(v, dict)
+                and isinstance(v.get("base"), str) and isinstance(v.get("applied"), str)}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def save_badges(badges):
+    tmp = _badges_file() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(badges, fh)
+    os.replace(tmp, _badges_file())
 
 
 # ---------- herdr socket ----------
@@ -331,6 +360,58 @@ def auto_rename_new_pane(pane_id, log):
     save_names(applied)
     log("auto_rename new pane %s: %s" % (pane_id, name))
     return None
+
+
+# ---------- status badges ----------
+
+def sync_badges(log, pane_ids=None, tab_id=None, restore_tab=None):
+    """Make labels match status. Targets: `pane_ids`, or every pane of `tab_id`,
+    or (restore_tab) every pane of that tab with badges removed. Panes of tabs
+    that are not enabled are restored. Only pane.rename; no-op when the label
+    is already correct (so our own rename never causes more work)."""
+    panes = {p["pane_id"]: p for p in request("pane.list")["panes"]}
+    enabled = load_enabled() if restore_tab is None else set()
+    state = core.prune_applied(load_badges(), set(panes))
+    if pane_ids is not None:
+        targets = [panes[i] for i in pane_ids if i in panes]
+    else:
+        want = restore_tab or tab_id
+        targets = [p for p in panes.values() if p.get("tab_id") == want]
+    changed = False
+    for p in targets:
+        pid = p["pane_id"]
+        label = p.get("label")
+        entry = state.get(pid)
+        if p.get("tab_id") not in enabled or not load_status_badges():
+            # never touch labels we did not badge (entry None) in a disabled tab
+            new, rename = None, (core.plan_restore(label, entry) if entry else None)
+        else:
+            status = p.get("agent_status") if p.get("agent") else None
+            fallback = None
+            if not label and status and load_auto_rename() and p.get("cwd"):
+                taken = [core.strip_prefix(q.get("label")) for q in panes.values()
+                         if q.get("tab_id") == p.get("tab_id") and q["pane_id"] != pid
+                         and q.get("label")]
+                fallback = core.name_for_new(_pane_base(p), taken)
+            if not label and not status:
+                new, rename = None, None
+            else:
+                new, rename = core.plan_badge(label, status, entry, fallback)
+        if rename is not None:
+            try:
+                request("pane.rename", {"pane_id": pid, "label": rename})
+            except RECOVERABLE as exc:
+                log("pane.rename %s failed: %s" % (pid, exc))
+                continue
+            log("badge %s: %r -> %r" % (pid, label, rename))
+        if new != entry:
+            changed = True
+            if new:
+                state[pid] = new
+            else:
+                state.pop(pid, None)
+    if changed or set(load_badges()) != set(state):
+        save_badges(state)
 
 
 # ---------- applying a layout ----------
@@ -626,6 +707,7 @@ class Daemon:
         self.pending = []      # [(tab_id, pane)] re-apply requests (user focused meanwhile)
         self.stop = False
         self.critical = False
+        self.badge_timers = {}  # pane_id -> debounce Timer for status badges
 
     # -- signals --
     def _on_term(self, signum, frame):
@@ -707,13 +789,34 @@ class Daemon:
             enabled = load_enabled()
             enabled.discard(tab_id)
             save_enabled(enabled)
+            if load_status_badges():
+                self.badge_safe(restore_tab=tab_id)
             self.failures.ok(tab_id)
             self.log("tab %s disabled after %d consecutive failures" % (tab_id, FAIL_LIMIT))
             notify("smart focus", "disabled for %s after %d consecutive failures" % (tab_id, FAIL_LIMIT))
 
+    def schedule_badge(self, pane_id, delay=BADGE_DEBOUNCE_S):
+        """Per-pane debounce: a flapping status collapses into one rename that
+        reads the live status when the timer fires."""
+        old = self.badge_timers.pop(pane_id, None)
+        if old:
+            old.cancel()
+        t = threading.Timer(delay, self.q.put,
+                            (("badge_flush", {"pane_id": pane_id}, time.monotonic()),))
+        t.daemon = True
+        self.badge_timers[pane_id] = t
+        t.start()
+
+    def badge_safe(self, **kw):
+        try:
+            sync_badges(self.log, **kw)
+        except RECOVERABLE as exc:
+            self.log("status_badges failed: %s" % exc)
+
     def handle_batch(self, events):
         focus_panes, layout_tabs, any_tab_focus, requested = [], [], False, False
         new_panes = []
+        status_panes, flush_panes = [], []
         for name, data, ts in events:
             if name == "pane_focused" and data.get("pane_id"):
                 start, end, panes = self.echo
@@ -730,6 +833,11 @@ class Daemon:
                 tab_id = (data.get("layout") or {}).get("tab_id") or data.get("tab_id")
                 if tab_id:
                     layout_tabs.append(tab_id)
+            elif name == "pane_agent_status_changed":
+                if data.get("pane_id"):
+                    status_panes.append(data["pane_id"])
+            elif name == "badge_flush":
+                flush_panes.append(data.get("pane_id"))
             elif name == "rename_retry":
                 new_panes.append((data.get("pane_id"), True))
             elif name == "pane_created":
@@ -745,6 +853,11 @@ class Daemon:
         done_tabs = set()
         if requested:  # toggle/enable from the CLI: only the daemon moves panes
             for tab_id in take_apply_requests():
+                if tab_id.startswith("off:"):  # disable: remove badges, back to base names
+                    tab_id = tab_id[4:]
+                    if load_status_badges():
+                        self.badge_safe(restore_tab=tab_id)
+                    continue
                 try:
                     layout = export_layout(tab_id=tab_id)
                 except (HerdrError, OSError, ValueError, KeyError) as exc:
@@ -756,6 +869,8 @@ class Daemon:
                         auto_rename_tab(tab_id, core.leaves(layout["root"]), self.log)
                     except RECOVERABLE as exc:
                         self.log("auto_rename %s failed: %s" % (tab_id, exc))
+                if load_status_badges():
+                    self.badge_safe(tab_id=tab_id)
                 self.apply_for(layout)
         if new_panes and load_auto_rename():
             for pid, is_retry in dict.fromkeys(new_panes):
@@ -769,6 +884,17 @@ class Daemon:
                                         (("rename_retry", {"pane_id": pid}, time.monotonic()),))
                     t.daemon = True
                     t.start()
+        if load_status_badges():
+            for pid in dict.fromkeys(status_panes):
+                self.schedule_badge(pid)
+            for pid, _retry in dict.fromkeys(new_panes):
+                if pid:
+                    self.schedule_badge(pid, 1.5)  # after auto_rename (+ its retry)
+            due = [pid for pid in dict.fromkeys(flush_panes) if pid]
+            for pid in due:
+                self.badge_timers.pop(pid, None)
+            if due:
+                self.badge_safe(pane_ids=due)
         if focus_panes:
             pane_id = focus_panes[-1]
             try:
@@ -964,8 +1090,8 @@ def cmd_toggle_like(action):
     msg = "smart focus %s for %s (ratio %.2f)" % ("ON" if want else "OFF", tab, load_ratio())
     print(msg)
     notify("smart focus", msg)
-    if want:  # the daemon applies (only it moves panes); CLI just asks
-        request_apply(tab)
+    if want or load_status_badges():  # the daemon applies/restores; CLI just asks
+        request_apply(tab if want else "off:" + tab)
         for _ in range(20):
             pid = daemon_pid()
             if pid:
@@ -984,6 +1110,7 @@ def cmd_status():
             "tab_enabled": tab in load_enabled(), "focus_ratio": load_ratio(),
             "layout": load_layout(), "stack_ratio": load_stack_ratio(),
             "balance_others": load_balance(), "auto_rename": load_auto_rename(),
+            "status_badges": load_status_badges(),
             "enabled_tabs": sorted(load_enabled()), "state_dir": state_dir()}
     out = json.dumps(info, indent=2)
     print(out)

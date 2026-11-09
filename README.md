@@ -92,11 +92,45 @@ panes without a manual name get the name of their repo:
   applied in `names.json` (state dir, `{pane_id: name}`) and only renames a
   pane whose current `label` is empty (never named by us) or still equals the
   recorded name. If you rename it afterwards, the plugin releases that pane.
-- Disabling smart focus keeps the names (nothing is cleared). Clear one with
+- Disabling smart focus keeps the names (nothing is cleared; only status badge prefixes are removed). Clear one with
   `herdr pane rename <pane> --clear`.
 - Only `pane.rename` is used (never send-text/send-keys).
 - Pure logic: `smart_focus_core.repo_display_name`, `dedupe_names`,
   `should_manage`, `plan_renames`.
+
+## Status badges
+
+`status_badges` (bool, default `true`; env `HERDR_SMART_FOCUS_STATUS_BADGES=0|1`).
+Real time and event driven (`pane.agent_status_changed`, no polling), only on
+tabs with smart focus ON. Every pane that runs an agent gets an emoji prefix
+in its label with the same color as herdr's sidebar status dot:
+
+| status  | sidebar color (default theme, catppuccin mocha) | prefix |
+|---------|---------------------------------------------------|--------|
+| working | yellow                                            | 🟡 |
+| blocked | red                                               | 🔴 |
+| done    | teal (no teal emoji: closest is blue)             | 🔵 |
+| idle    | green                                             | 🟢 |
+| unknown | overlay0 (grey)                                   | ⚪ |
+
+Source: herdr v0.9.5 `src/client/shell.rs` `status_color()` (dots and symbols
+share it). Panes without an agent get no prefix.
+
+- The plugin only controls the prefix. Base name = your manual label, else the
+  repo name (when `auto_rename` is on and the pane has a cwd). Stored in
+  `badges.json` (state dir) as `{pane_id: {base, applied}}`.
+- If the current label differs from what was applied (you renamed it), the new
+  text (minus any known badge) becomes the base and the prefix is re-applied
+  on the next event for that pane (status change, pane created, enable).
+- Per-pane debounce (300 ms) for flapping status; the live status is read when
+  the timer fires. No rename when the label is already right, so our own
+  rename causes no further work (`pane.renamed` is not subscribed).
+- Disabling the tab removes the prefixes (back to the base name). Setting
+  `status_badges = false` stops applying; run disable on a tab to clean up.
+- A label you wrote starting with one of these emoji has it stripped as a prefix.
+- Only `pane.rename` is used (never send-text/send-keys).
+- Pure logic: `smart_focus_core.badge_for`, `strip_prefix`, `compose`,
+  `adopt_base`, `plan_badge`, `plan_restore`.
 
 ## Stack layouts
 

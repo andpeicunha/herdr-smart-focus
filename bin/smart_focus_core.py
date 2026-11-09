@@ -459,3 +459,69 @@ def name_for_new(base, taken):
 
 def prune_applied(applied, live_ids):
     return {k: v for k, v in applied.items() if k in live_ids}
+
+
+# ---------- status badges (pure) ----------
+# Same colors as herdr's sidebar status dots (herdr v0.9.5,
+# src/client/shell.rs `status_color`, default catppuccin theme):
+#   working -> palette.yellow, blocked -> palette.red, done -> palette.teal,
+#   idle -> palette.green, unknown -> palette.overlay0 (grey).
+# Emoji have no teal: done uses the closest blue/cyan circle.
+BADGES = {
+    "working": "\U0001F7E1",  # yellow
+    "blocked": "\U0001F534",  # red
+    "done": "\U0001F535",     # blue (teal)
+    "idle": "\U0001F7E2",     # green
+    "unknown": "⚪",      # white/grey
+}
+
+
+def badge_for(status):
+    """Emoji for an agent status; "" for no agent (None) or an unknown value."""
+    return BADGES.get(status, "") if status else ""
+
+
+def strip_prefix(label):
+    """Remove ONE leading status badge (and the single space after it)."""
+    s = label or ""
+    for b in BADGES.values():
+        if s.startswith(b):
+            s = s[len(b):]
+            if s.startswith(" "):
+                s = s[1:]
+            break
+    return s
+
+
+def compose(status, base):
+    b = badge_for(status)
+    return "%s %s" % (b, base) if b else base
+
+
+def adopt_base(label, entry, fallback=None):
+    """Base name of a pane. entry = {"base", "applied"} we recorded (or None).
+    Label still equals what we applied -> keep recorded base. Otherwise the
+    user (or auto_rename) set it: adopt its text minus any known prefix.
+    Empty -> `fallback` (repo name) or None."""
+    if entry and label == entry.get("applied"):
+        return entry.get("base") or fallback
+    return strip_prefix(label) or fallback
+
+
+def plan_badge(label, status, entry, fallback=None):
+    """-> (new_entry or None, rename_to or None). Never renames when the
+    label is already the target; no base -> nothing to do (entry dropped)."""
+    base = adopt_base(label, entry, fallback)
+    if not base:
+        return None, None
+    target = compose(status, base)
+    return {"base": base, "applied": target}, (target if label != target else None)
+
+
+def plan_restore(label, entry):
+    """Name to put back when badges are removed (None = leave as is)."""
+    if entry and label == entry.get("applied"):
+        new = entry.get("base")
+    else:
+        new = strip_prefix(label)
+    return new if new and new != label else None
