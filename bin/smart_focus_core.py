@@ -525,3 +525,19 @@ def plan_restore(label, entry):
     else:
         new = strip_prefix(label)
     return new if new and new != label else None
+
+
+# ---------- event subscriptions (pure) ----------
+# herdr's Subscription schema: `pane.agent_status_changed` REQUIRES pane_id (one
+# subscription per pane). One invalid entry makes the whole events.subscribe
+# fail, so the global events and the per-pane status events use separate
+# connections.
+MAIN_SUBSCRIPTIONS = ("pane.focused", "pane.created", "pane.closed", "layout.updated", "tab.focused")
+
+
+def main_subscriptions():
+    return [{"type": t} for t in MAIN_SUBSCRIPTIONS]
+
+
+def status_subscriptions(pane_ids):
+    return [{"type": "pane.agent_status_changed", "pane_id": pid} for pid in sorted(set(pane_ids)) if pid]

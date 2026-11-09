@@ -26,8 +26,7 @@ SELF_SUPPRESS_S = 0.5
 RECONNECT_GIVEUP_S = 60
 RENAME_RETRY_S = 1.0
 BADGE_DEBOUNCE_S = 0.3
-SUBSCRIPTIONS = ["pane.focused", "pane.created", "pane.closed", "layout.updated", "tab.focused",
-                 "pane.agent_status_changed"]
+STATUS_REFRESH_S = 0.3
 
 
 # ---------- paths / config / state ----------
@@ -693,6 +692,85 @@ def take_apply_requests():
     return core.parse_requests(text)
 
 
+# ---------- per-pane status subscription (separate connection) ----------
+
+class StatusWatcher:
+    """pane.agent_status_changed needs one subscription per pane. Runs on its
+    own socket/thread: a failure here never touches the main event stream."""
+
+    def __init__(self, q, log):
+        self.q, self.log = q, log
+        self.wake = threading.Event()
+        self.sock = None
+        self.panes = None
+
+    def refresh(self):
+        self.wake.set()
+
+    def _wanted(self):
+        if not load_status_badges():
+            return set()
+        enabled = load_enabled()
+        return {p["pane_id"] for p in request("pane.list")["panes"] if p.get("tab_id") in enabled}
+
+    def _close(self):
+        s, self.sock = self.sock, None
+        if s:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            s.close()
+
+    def _listen(self, panes):
+        s = socket.socket(socket.AF_UNIX)
+        s.connect(socket_path())
+        self.sock = s
+        sub = {"id": "status", "method": "events.subscribe",
+               "params": {"subscriptions": core.status_subscriptions(panes)}}
+        s.sendall((json.dumps(sub) + "\n").encode())
+        for line in s.makefile("r", encoding="utf-8"):
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if "error" in msg:
+                raise HerdrError(str(msg["error"]))
+            ev = msg.get("event")
+            if ev:
+                self.q.put((ev.replace(".", "_"), msg.get("data") or {}, time.monotonic()))
+        raise HerdrError("status stream closed")
+
+    def _reader(self, panes):
+        try:
+            self._listen(panes)
+        except Exception as exc:  # noqa: BLE001
+            if self.panes == panes:  # not a deliberate close for a new pane set
+                self.log("status reader: %s; retrying" % exc)
+                self.panes = None
+                time.sleep(2)
+            self.wake.set()
+
+    def run(self):
+        while True:
+            self.wake.wait()
+            time.sleep(STATUS_REFRESH_S)
+            self.wake.clear()
+            try:
+                want = self._wanted()
+            except Exception as exc:  # noqa: BLE001
+                self.log("status watcher: %s" % exc)
+                time.sleep(2)
+                self.wake.set()
+                continue
+            if want == self.panes:
+                continue
+            self._close()
+            self.panes = want
+            if want:
+                threading.Thread(target=self._reader, args=(want,), daemon=True).start()
+
+
 # ---------- daemon ----------
 
 class Daemon:
@@ -707,6 +785,7 @@ class Daemon:
         self.pending = []      # [(tab_id, pane)] re-apply requests (user focused meanwhile)
         self.stop = False
         self.critical = False
+        self.status_watch = StatusWatcher(self.q, self.log)
         self.badge_timers = {}  # pane_id -> debounce Timer for status badges
 
     # -- signals --
@@ -817,6 +896,7 @@ class Daemon:
         focus_panes, layout_tabs, any_tab_focus, requested = [], [], False, False
         new_panes = []
         status_panes, flush_panes = [], []
+        watch_refresh = False
         for name, data, ts in events:
             if name == "pane_focused" and data.get("pane_id"):
                 start, end, panes = self.echo
@@ -833,6 +913,8 @@ class Daemon:
                 tab_id = (data.get("layout") or {}).get("tab_id") or data.get("tab_id")
                 if tab_id:
                     layout_tabs.append(tab_id)
+            elif name == "pane_closed":
+                watch_refresh = True
             elif name == "pane_agent_status_changed":
                 if data.get("pane_id"):
                     status_panes.append(data["pane_id"])
@@ -841,6 +923,7 @@ class Daemon:
             elif name == "rename_retry":
                 new_panes.append((data.get("pane_id"), True))
             elif name == "pane_created":
+                watch_refresh = True
                 pane = data.get("pane") or {}
                 pid = pane.get("pane_id") or data.get("pane_id")
                 tab_id = pane.get("tab_id") or data.get("tab_id")
@@ -851,6 +934,8 @@ class Daemon:
                 elif pid:
                     focus_panes.append(pid)
         done_tabs = set()
+        if requested or watch_refresh:
+            self.status_watch.refresh()  # enabled-tab pane set may have changed
         if requested:  # toggle/enable from the CLI: only the daemon moves panes
             for tab_id in take_apply_requests():
                 if tab_id.startswith("off:"):  # disable: remove badges, back to base names
@@ -941,7 +1026,7 @@ class Daemon:
         s = socket.socket(socket.AF_UNIX)
         s.connect(socket_path())
         sub = {"id": "sub", "method": "events.subscribe",
-               "params": {"subscriptions": [{"type": t} for t in SUBSCRIPTIONS]}}
+               "params": {"subscriptions": core.main_subscriptions()}}
         s.sendall((json.dumps(sub) + "\n").encode())
         for line in s.makefile("r", encoding="utf-8"):
             try:
@@ -985,6 +1070,8 @@ class Daemon:
         if self.stop:
             return
         threading.Thread(target=self.reader_loop, daemon=True).start()
+        threading.Thread(target=self.status_watch.run, daemon=True).start()
+        self.status_watch.refresh()
         if os.path.exists(_request_file()):
             self.q.put(("apply_request", {}, time.monotonic()))
         while True:

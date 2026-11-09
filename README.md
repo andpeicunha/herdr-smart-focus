@@ -122,6 +122,7 @@ share it). Panes without an agent get no prefix.
 - If the current label differs from what was applied (you renamed it), the new
   text (minus any known badge) becomes the base and the prefix is re-applied
   on the next event for that pane (status change, pane created, enable).
+- `pane.agent_status_changed` needs one subscription per pane (schema), so a separate watcher connection subscribes per pane of enabled tabs and is refreshed on pane created/closed and enable/disable; it never affects the main focus/layout stream.
 - Per-pane debounce (300 ms) for flapping status; the live status is read when
   the timer fires. No rename when the label is already right, so our own
   rename causes no further work (`pane.renamed` is not subscribed).
