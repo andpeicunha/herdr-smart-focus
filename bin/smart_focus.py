@@ -767,7 +767,8 @@ class StatusWatcher:
                 continue
             self._close()
             self.panes = want
-            if want:
+            if want:  # startup / reconnect / pane set change: reconcile all labels once
+                self.q.put(("badge_sweep", {"pane_ids": sorted(want)}, time.monotonic()))
                 threading.Thread(target=self._reader, args=(want,), daemon=True).start()
 
 
@@ -918,6 +919,8 @@ class Daemon:
             elif name == "pane_agent_status_changed":
                 if data.get("pane_id"):
                     status_panes.append(data["pane_id"])
+            elif name == "badge_sweep":
+                flush_panes.extend(data.get("pane_ids") or [])
             elif name == "badge_flush":
                 flush_panes.append(data.get("pane_id"))
             elif name == "rename_retry":
