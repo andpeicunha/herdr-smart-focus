@@ -498,6 +498,19 @@ def compose(status, base):
     return "%s %s" % (b, base) if b else base
 
 
+def parent_of(pane):
+    """Coordinator pane id from the `parent` token of a child pane, else None."""
+    toks = pane.get("tokens")
+    p = toks.get("parent") if isinstance(toks, dict) else None
+    return p if isinstance(p, str) and p else None
+
+
+def blocked_parents(panes):
+    """Pane ids of coordinators with a child agent blocked (waiting for the user)."""
+    return {parent_of(p) for p in panes
+            if p.get("agent") and p.get("agent_status") == "blocked"} - {None}
+
+
 def adopt_base(label, entry, fallback=None):
     """Base name of a pane. entry = {"base", "applied"} we recorded (or None).
     Label still equals what we applied -> keep recorded base. Otherwise the

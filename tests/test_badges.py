@@ -102,5 +102,23 @@ class RestoreTest(unittest.TestCase):
         self.assertIsNone(core.plan_restore(None, {"base": "x", "applied": Y + " x"}))
 
 
+class BlockedParentsTest(unittest.TestCase):
+    def test_blocked_child_marks_parent(self):
+        panes = [
+            {"pane_id": "p1", "agent": "claude", "agent_status": "working"},
+            {"pane_id": "p2", "agent": "claude", "agent_status": "blocked", "tokens": {"parent": "p1"}},
+            {"pane_id": "p3", "agent": "claude", "agent_status": "working", "tokens": {"parent": "p9"}},
+        ]
+        self.assertEqual(core.blocked_parents(panes), {"p1"})
+        self.assertEqual(core.parent_of(panes[2]), "p9")
+        self.assertIsNone(core.parent_of(panes[0]))
+
+    def test_no_blocked_child_or_no_parent(self):
+        self.assertEqual(core.blocked_parents([
+            {"pane_id": "p2", "agent": "claude", "agent_status": "blocked"},
+            {"pane_id": "p3", "agent": "claude", "agent_status": "idle", "tokens": {"parent": "p1"}},
+        ]), set())
+
+
 if __name__ == "__main__":
     unittest.main()

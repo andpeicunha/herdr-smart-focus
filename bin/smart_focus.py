@@ -371,11 +371,14 @@ def sync_badges(log, pane_ids=None, tab_id=None, restore_tab=None):
     panes = {p["pane_id"]: p for p in request("pane.list")["panes"]}
     enabled = load_enabled() if restore_tab is None else set()
     state = core.prune_applied(load_badges(), set(panes))
-    if pane_ids is not None:
-        targets = [panes[i] for i in pane_ids if i in panes]
+    if pane_ids is not None:  # a child's change also re-badges its coordinator
+        ids = list(dict.fromkeys(
+            list(pane_ids) + [core.parent_of(panes[i]) for i in pane_ids if i in panes]))
+        targets = [panes[i] for i in ids if i in panes]
     else:
         want = restore_tab or tab_id
         targets = [p for p in panes.values() if p.get("tab_id") == want]
+    waiting = core.blocked_parents(panes.values())
     changed = False
     for p in targets:
         pid = p["pane_id"]
@@ -386,6 +389,8 @@ def sync_badges(log, pane_ids=None, tab_id=None, restore_tab=None):
             new, rename = None, (core.plan_restore(label, entry) if entry else None)
         else:
             status = p.get("agent_status") if p.get("agent") else None
+            if status and pid in waiting:  # a child waits for the user: red
+                status = "blocked"
             fallback = None
             if not label and status and load_auto_rename() and p.get("cwd"):
                 taken = [core.strip_prefix(q.get("label")) for q in panes.values()
